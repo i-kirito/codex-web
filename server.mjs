@@ -5804,10 +5804,6 @@ function capacityRetryTurnFromConversation(conversation) {
 }
 
 function scheduleCapacityAutoRetries(change) {
-  // Do not replay a failed turn from session synchronization. The provider
-  // capacity error is shown in the conversation and can be retried manually.
-  return;
-  /*
   for (const candidate of Array.isArray(change?.changedIds) ? change.changedIds : []) {
     const threadId = cleanNativeThreadId(candidate);
     if (!threadId) continue;
@@ -5822,7 +5818,6 @@ function scheduleCapacityAutoRetries(change) {
     }
     scheduleCapacityAutoRetry(threadId, conversation);
   }
-  */
 }
 
 function scheduleCapacityAutoRetry(threadId, conversation = null) {
