@@ -5809,6 +5809,13 @@ function scheduleCapacityAutoRetries(change) {
     if (!threadId) continue;
     let conversation = null;
     try { conversation = nativeSessions.get(threadId); } catch {}
+    // Capacity failures must surface as an actionable paused turn. Replaying
+    // the same request from session-change events keeps the UI in syncing
+    // forever when the provider remains full.
+    if (latestCapacityTerminal(conversation)) {
+      clearCapacityAutoRetryState(threadId, { clearPause: false });
+      continue;
+    }
     scheduleCapacityAutoRetry(threadId, conversation);
   }
 }
