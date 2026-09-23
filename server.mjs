@@ -253,7 +253,10 @@ const APP_QUEUE_BROADCAST_GRACE_MS = Math.min(APP_QUEUE_PERSIST_TIMEOUT_MS, 450)
 const APP_INTERRUPTED_QUEUE_PAUSE_REASON = 'Interrupted before the steer was accepted.';
 const CAPACITY_AUTO_RETRY_DELAYS_MS = Object.freeze([0, 1000, 2000, 5000, 10000, 20000, 30000, 45000, 60000]);
 const CAPACITY_AUTO_RETRY_STEADY_DELAY_MS = 60000;
-const CAPACITY_AUTO_RETRY_MAX_ATTEMPTS = 50;
+// A capacity response is actionable: the user can choose another model or
+// retry later. Keep the automatic recovery short so a persisted terminal
+// cannot leave the conversation in an endless "syncing" state after restart.
+const CAPACITY_AUTO_RETRY_MAX_ATTEMPTS = 3;
 
 function capacityAutoRetryDelayMs(attempt) {
   const index = Math.max(0, Math.floor(Number(attempt) || 1) - 1);
@@ -426,15 +429,6 @@ let chatGPTConversationsCache = { value: null, expiresAt: 0, pending: null };
 
 nativeSessions.on('change', handleNativeSessionChange);
 nativeSessions.start();
-setTimeout(() => {
-  for (const session of nativeSessions.list()) {
-    const threadId = cleanNativeThreadId(session?.id);
-    if (!threadId) continue;
-    let conversation = null;
-    try { conversation = nativeSessions.get(threadId); } catch {}
-    scheduleCapacityAutoRetry(threadId, conversation);
-  }
-}, 250).unref?.();
 registerAppServerClient(appServerClient, { scope: 'global' });
 desktopIpcClient.on('disconnect', (error) => {
   markDesktopThreadStatesDisconnected(error?.message || 'Codex Desktop IPC 已断开');
@@ -5851,7 +5845,7 @@ function scheduleCapacityAutoRetry(threadId, conversation = null) {
     capacityAutoRetryStates.set(id, stopped);
     setPromptQueuePause(id, {
       reason: 'capacity_retry',
-      message: '模型持续繁忙，已在第50次重试失败后停止，可手动继续',
+      message: `模型持续繁忙，已在第${CAPACITY_AUTO_RETRY_MAX_ATTEMPTS}次重试失败后停止，可切换模型或手动继续`,
       pausedAt: new Date().toISOString(),
     });
     broadcastNativeRuntime({
