@@ -118,7 +118,7 @@ test('app-server terminal errors broadcast full detail before closing the turn',
 });
 
 
-test('capacity errors stop after a short native empty-input retry window', async () => {
+test('capacity errors stop after the 50th native empty-input retry', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const delayStart = serverSource.indexOf('const CAPACITY_AUTO_RETRY_DELAYS_MS');
   const delayEnd = serverSource.indexOf('\nconst HOMEPAGE_API_TOKEN', delayStart);
@@ -127,7 +127,7 @@ test('capacity errors stop after a short native empty-input retry window', async
     serverSource.slice(delayStart, delayEnd) + '; return { capacityAutoRetryDelayMs, CAPACITY_AUTO_RETRY_MAX_ATTEMPTS };',
   )();
 
-  assert.equal(CAPACITY_AUTO_RETRY_MAX_ATTEMPTS, 3);
+  assert.equal(CAPACITY_AUTO_RETRY_MAX_ATTEMPTS, 50);
   assert.deepEqual(
     Array.from({ length: 12 }, (_, index) => capacityAutoRetryDelayMs(index + 1)),
     [0, 1000, 2000, 5000, 10000, 20000, 30000, 45000, 60000, 60000, 60000, 60000],
@@ -136,7 +136,7 @@ test('capacity errors stop after a short native empty-input retry window', async
   assert.equal(capacityAutoRetryDelayMs(50), 60000);
   assert.match(serverSource, /attempt > CAPACITY_AUTO_RETRY_MAX_ATTEMPTS/);
   assert.match(serverSource, /status:\s*'stopped'/);
-  assert.match(serverSource, /第\$\{CAPACITY_AUTO_RETRY_MAX_ATTEMPTS\}次重试失败后停止/);
+  assert.match(serverSource, /第50次重试失败后停止/);
   assert.ok(serverSource.includes("attempt+'/'+maxAttempts"));
   assert.match(serverSource, /input:\s*\[\],[\s\S]{0,500}turnTrigger:\s*'capacity_retry_automatic'/);
   assert.match(serverSource, /turnTrigger:\s*turn\.turnTrigger/);
