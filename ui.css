@@ -2219,6 +2219,7 @@ body .grok2ApiConsoleIconButton:disabled {
 }
 
 .subQuotaCredentialHint {
+  display: none;
   color: var(--text-subtle);
   font-size: 10px;
   line-height: 1.4;
