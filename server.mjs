@@ -18340,7 +18340,7 @@ function ensureSubQuotaSettingsDialog(){
   codexSummary.append(codexBalances,codexProgress,codexMeta);
   const codexCreditsVisibility=createSubQuotaVisibilityToggle('点数与美元余额');
   const codexCreditsControl=document.createElement('div');
-  codexCreditsControl.className='subQuotaSettingsSourceHead';
+  codexCreditsControl.className='subQuotaSettingsSourceHead subQuotaCodexCreditsControl';
   const codexCreditsLabel=document.createElement('span');
   codexCreditsLabel.textContent='在卡片显示点数与美元余额';
   codexCreditsControl.append(codexCreditsLabel,codexCreditsVisibility);

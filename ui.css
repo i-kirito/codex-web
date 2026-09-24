@@ -1747,6 +1747,44 @@ body .grok2ApiConsoleIconButton:disabled {
   border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
 }
 
+.subQuotaCodexCreditsControl {
+  min-height: 42px;
+  gap: 12px;
+  border: 1px solid color-mix(in srgb, var(--primary) 18%, var(--border));
+  border-radius: 10px;
+  background: linear-gradient(
+    110deg,
+    color-mix(in srgb, var(--primary) 7%, var(--surface-raised)),
+    color-mix(in srgb, var(--surface-raised) 82%, transparent)
+  );
+  padding: 8px 10px 8px 13px;
+}
+
+.subQuotaCodexCreditsControl::before {
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--primary) 25%, var(--border));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--primary) 12%, var(--surface));
+  color: var(--primary);
+  content: '$';
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.subQuotaCodexCreditsControl > span {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 720;
+  line-height: 1.35;
+}
+
 .subQuotaSettingsSourceIdentity {
   display: flex;
   min-width: 0;
