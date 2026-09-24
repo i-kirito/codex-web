@@ -364,6 +364,7 @@ const automationStore = new AutomationStore(CODEX_HOME);
 const SUB2API_ADMIN_API_KEY = String(process.env.SUB2API_ADMIN_API_KEY || '').trim();
 const startupSubQuotaState = readStartupSubQuotaState(process.env);
 let subQuotaConfigs = startupSubQuotaState.sources;
+let subQuotaRemovedBuiltinIds = new Set(startupSubQuotaState.removedBuiltinIds || []);
 let codexAppQuotaVisible = startupSubQuotaState.codexAppVisible;
 let codexAppCreditsVisible = startupSubQuotaState.codexAppCreditsVisible;
 let codexAppQuotaCache = {
@@ -1209,23 +1210,31 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
     const existingConfigs = withBuiltinSubQuotaConfigs(subQuotaConfigs);
     const existingById = new Map(existingConfigs.map((config) => [config.id, config]));
     const requestedById = new Map(requestedSources.map((source) => [source.id, source]));
+    const removedBuiltinIds = new Set(subQuotaRemovedBuiltinIds);
     const nextConfigs = [];
     if (Array.isArray(req.body?.sources)) {
       for (const provider of SUB_QUOTA_DEFAULT_ORDER) {
-        if (!requestedById.has(provider)) requestedById.set(provider, existingById.get(provider) || emptySubQuotaConfig(provider, {
+        if (!requestedById.has(provider) && !removedBuiltinIds.has(provider)) requestedById.set(provider, existingById.get(provider) || emptySubQuotaConfig(provider, {
           id: provider,
           builtin: true,
         }));
       }
     } else {
-      for (const config of existingConfigs) requestedById.set(config.id, config);
+      for (const config of existingConfigs) {
+        if (!removedBuiltinIds.has(config.id)) requestedById.set(config.id, config);
+      }
       for (const requested of requestedSources) requestedById.set(requested.id, requested);
     }
     for (const requested of requestedSources) {
-      if (requested.remove && !requested.builtin) requestedById.delete(requested.id);
+      if (requested.remove) {
+        requestedById.delete(requested.id);
+        if (SUB_QUOTA_BUILTIN_IDS.has(requested.id)) removedBuiltinIds.add(requested.id);
+        continue;
+      }
+      if (SUB_QUOTA_BUILTIN_IDS.has(requested.id)) removedBuiltinIds.delete(requested.id);
     }
     for (const requested of requestedById.values()) {
-      if (requested.remove && !requested.builtin) continue;
+      if (requested.remove) continue;
       const existing = existingById.get(requested.id);
       const suppliedApiKey = String(requested.apiKey || '').trim();
       const hasSubmittedApiKeys = requested.apiKeys !== undefined;
@@ -1277,17 +1286,22 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
     if (requestedOrder) {
       for (const config of nextConfigs) config.order = requestedOrder.indexOf(config.id);
     }
-    const normalizedNextConfigs = withBuiltinSubQuotaConfigs(nextConfigs)
+    const normalizedNextConfigs = withBuiltinSubQuotaConfigs(nextConfigs, { excludedBuiltinIds: removedBuiltinIds })
       .map((config, index) => ({ ...config, order: index }));
     const configured = configuredSubQuotaConfigs(normalizedNextConfigs);
 
     try {
-      persistSubQuotaConfigs(normalizedNextConfigs, { codexAppVisible: nextCodexAppVisible, codexAppCreditsVisible: nextCodexAppCreditsVisible });
+      persistSubQuotaConfigs(normalizedNextConfigs, {
+        codexAppVisible: nextCodexAppVisible,
+        codexAppCreditsVisible: nextCodexAppCreditsVisible,
+        removedBuiltinIds,
+      });
     } catch (error) {
       error.statusCode = 500;
       throw error;
     }
     subQuotaConfigs = normalizedNextConfigs;
+    subQuotaRemovedBuiltinIds = removedBuiltinIds;
     codexAppQuotaVisible = nextCodexAppVisible;
     codexAppCreditsVisible = nextCodexAppCreditsVisible;
     subQuotaService = createSubQuotaService(subQuotaConfigs);
@@ -8709,11 +8723,12 @@ function emptySubQuotaConfig(provider, options = {}) {
   });
 }
 
-function withBuiltinSubQuotaConfigs(configs = []) {
+function withBuiltinSubQuotaConfigs(configs = [], { excludedBuiltinIds = [] } = {}) {
   const sources = subQuotaConfigArray(configs).map((config) => withSubQuotaApiKeys(config));
   const ids = new Set(sources.map((config) => config.id));
+  const excluded = new Set(excludedBuiltinIds);
   for (const provider of SUB_QUOTA_DEFAULT_ORDER) {
-    if (ids.has(provider)) continue;
+    if (ids.has(provider) || excluded.has(provider)) continue;
     sources.push(emptySubQuotaConfig(provider, {
       id: provider,
       builtin: true,
@@ -8723,7 +8738,7 @@ function withBuiltinSubQuotaConfigs(configs = []) {
   return sortSubQuotaConfigs(sources);
 }
 
-function normalizeStoredSubQuotaSources(value) {
+function normalizeStoredSubQuotaSources(value, { excludedBuiltinIds = [] } = {}) {
   if (!Array.isArray(value)) throw new Error('额度来源配置必须是数组');
   if (value.length > SUB_QUOTA_MAX_SOURCES) throw new Error(`额度来源最多配置 ${SUB_QUOTA_MAX_SOURCES} 个`);
   const ids = new Set();
@@ -8751,7 +8766,16 @@ function normalizeStoredSubQuotaSources(value) {
       builtin: SUB_QUOTA_BUILTIN_IDS.has(id),
     });
   });
-  return withBuiltinSubQuotaConfigs(sources).map((source, index) => ({ ...source, order: index }));
+  const excluded = new Set(excludedBuiltinIds);
+  return withBuiltinSubQuotaConfigs(sources.filter((source) => !excluded.has(source.id)), { excludedBuiltinIds: excluded })
+    .map((source, index) => ({ ...source, order: index }));
+}
+
+function normalizeSubQuotaRemovedBuiltinIds(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value
+    .map((id) => String(id || '').trim())
+    .filter((id) => SUB_QUOTA_BUILTIN_IDS.has(id)))];
 }
 
 function readLegacySubQuotaConfigs(env = process.env) {
@@ -8814,15 +8838,20 @@ function readLegacySubQuotaConfigs(env = process.env) {
 function readStartupSubQuotaState(env = process.env) {
   const fallback = {
     sources: readLegacySubQuotaConfigs(env),
+    removedBuiltinIds: [],
     codexAppVisible: parseBoolean(env.CODEX_APP_QUOTA_VISIBLE, true),
     codexAppCreditsVisible: true,
   };
   if (!existsSync(SUB_QUOTA_SOURCES_FILE)) return fallback;
   try {
     const stored = JSON.parse(readFileSync(SUB_QUOTA_SOURCES_FILE, 'utf8'));
-    const sources = normalizeStoredSubQuotaSources(Array.isArray(stored) ? stored : stored?.sources);
+    const removedBuiltinIds = Array.isArray(stored)
+      ? []
+      : normalizeSubQuotaRemovedBuiltinIds(stored?.removedBuiltinIds);
+    const sources = normalizeStoredSubQuotaSources(Array.isArray(stored) ? stored : stored?.sources, { excludedBuiltinIds: removedBuiltinIds });
     return {
       sources,
+      removedBuiltinIds,
       codexAppVisible: normalizeSubQuotaVisibility(stored?.codexAppVisible, fallback.codexAppVisible),
       codexAppCreditsVisible: normalizeSubQuotaVisibility(stored?.codexAppCreditsVisible, fallback.codexAppCreditsVisible),
     };
@@ -8956,8 +8985,14 @@ function subQuotaOrderValue(configs) {
     .join(',');
 }
 
-function persistSubQuotaConfigs(configs, { codexAppVisible = codexAppQuotaVisible, codexAppCreditsVisible: creditsVisible = codexAppCreditsVisible } = {}) {
-  const sources = withBuiltinSubQuotaConfigs(configs).map((source, index) => ({ ...source, order: index }));
+function persistSubQuotaConfigs(configs, {
+  codexAppVisible = codexAppQuotaVisible,
+  codexAppCreditsVisible: creditsVisible = codexAppCreditsVisible,
+  removedBuiltinIds = [],
+} = {}) {
+  const excludedBuiltinIdSet = new Set(removedBuiltinIds);
+  const sources = withBuiltinSubQuotaConfigs(subQuotaConfigArray(configs).filter((source) => !excludedBuiltinIdSet.has(source.id)), { excludedBuiltinIds: excludedBuiltinIdSet })
+    .map((source, index) => ({ ...source, order: index }));
   if (sources.length > SUB_QUOTA_MAX_SOURCES) throw new Error(`额度来源最多配置 ${SUB_QUOTA_MAX_SOURCES} 个`);
   const persistedSources = sources.map((source) => {
     const { apiKey: _legacyApiKey, ...persisted } = withSubQuotaApiKeys(source);
@@ -8968,6 +9003,7 @@ function persistSubQuotaConfigs(configs, { codexAppVisible = codexAppQuotaVisibl
     updatedAt: new Date().toISOString(),
     codexAppVisible: codexAppVisible !== false,
     codexAppCreditsVisible: creditsVisible !== false,
+    removedBuiltinIds: normalizeSubQuotaRemovedBuiltinIds([...removedBuiltinIds]),
     sources: persistedSources,
   }, null, 2)}\n`);
   const configured = configuredSubQuotaConfigs(sources);
@@ -12171,6 +12207,7 @@ const archiveToggle = document.getElementById('archiveToggle'), archiveView = do
 const automationToggle = document.getElementById('automationToggle'), automationView = document.getElementById('automationView'), automationList = document.getElementById('automationList'), automationSearch = document.getElementById('automationSearch'), automationFilter = document.getElementById('automationFilter'), automationRefresh = document.getElementById('automationRefresh'), automationCreate = document.getElementById('automationCreate'), automationStatus = document.getElementById('automationStatus'), automationEditor = document.getElementById('automationEditor'), automationForm = document.getElementById('automationForm'), automationFormMessage = document.getElementById('automationFormMessage'), automationFrequency = document.getElementById('automationFrequency');
 let subQuotaToggle = null, subQuotaPopover = null, subQuotaStatus = null, subQuotaPrimarySource = null, subQuotaContent = null;
 let subQuotaSettingsForm = null, subQuotaSettingsInputs = new Map(), subQuotaSettingsStatus = null;
+let subQuotaSettingsRemovedSourceIds = new Set();
 let subQuotaSettingsOverlay = null, subQuotaSettingsDialog = null, subQuotaSettingsClose = null, subQuotaSettingsReturnFocus = null;
 let subQuotaSettingsSourceList = null, subQuotaSettingsCodexApp = null, subQuotaSettingsCreateSource = null;
 let subQuotaAddSourceType = null, subQuotaAddSourceButton = null, subQuotaSettingsMaxSources = 12, subQuotaSettingsMaxApiKeys = 8;
@@ -18176,7 +18213,8 @@ function syncSubQuotaAddButton(){
 }
 function removeSubQuotaSettingsSource(sourceId){
   const inputs=subQuotaSettingsInputs.get(sourceId);
-  if(!inputs||inputs.builtin)return;
+  if(!inputs)return;
+  subQuotaSettingsRemovedSourceIds.add(sourceId);
   inputs.source.remove();
   subQuotaSettingsInputs.delete(sourceId);
   syncSubQuotaMoveButtons();
@@ -18376,17 +18414,14 @@ function ensureSubQuotaSettingsDialog(){
     const sourceActions=document.createElement('div');
     sourceActions.className='subQuotaSettingsSourceActions';
     const visibilityToggle=createSubQuotaVisibilityToggle(displayName);
-    let removeButton=null;
-    if(!builtin){
-      removeButton=document.createElement('button');
-      removeButton.type='button';
-      removeButton.className='subQuotaSourceRemoveButton';
-      removeButton.title='删除此渠道';
-      removeButton.setAttribute('aria-label','删除 '+displayName);
-      setIconLabel(removeButton,'trash-2','删除此渠道',false);
-      removeButton.addEventListener('click',()=>removeSubQuotaSettingsSource(sourceId));
-      sourceActions.appendChild(removeButton);
-    }
+    const removeButton=document.createElement('button');
+    removeButton.type='button';
+    removeButton.className='subQuotaSourceRemoveButton';
+    removeButton.title='删除此渠道';
+    removeButton.setAttribute('aria-label','删除 '+displayName);
+    setIconLabel(removeButton,'trash-2','删除此渠道',false);
+    removeButton.addEventListener('click',()=>removeSubQuotaSettingsSource(sourceId));
+    sourceActions.appendChild(removeButton);
     const moveButtons=document.createElement('div');
     moveButtons.className='subQuotaMoveButtons';
     const moveUp=document.createElement('button');
@@ -19007,7 +19042,7 @@ async function syncSubQuotaSettings(){
     setSubQuotaVisibilityToggle(subQuotaSettingsCodexApp?.creditsVisibilityToggle,data.codexApp?.creditsVisible!==false);
     const incomingIds=new Set(sources.map((source)=>String(source.id||source.provider||'')));
     for(const [sourceId,inputs] of [...subQuotaSettingsInputs]){
-      if(!inputs.builtin&&!incomingIds.has(sourceId))removeSubQuotaSettingsSource(sourceId);
+      if(!incomingIds.has(sourceId))removeSubQuotaSettingsSource(sourceId);
     }
     for(const source of sources){
       const sourceId=String(source.id||source.provider||'');
@@ -19025,6 +19060,7 @@ async function syncSubQuotaSettings(){
         inputs=subQuotaSettingsInputs.get(sourceId);
       }
       if(!inputs)continue;
+      subQuotaSettingsRemovedSourceIds.delete(sourceId);
       inputs.provider=source.provider;
       inputs.builtin=source.builtin===true;
       if(inputs.nameInput)inputs.nameInput.value=source.name||subQuotaSourceDefinition(source.provider).title;
@@ -19047,7 +19083,7 @@ async function syncSubQuotaSettings(){
 }
 async function submitSubQuotaSettings(event){
   event.preventDefault();
-  if(!subQuotaSettingsForm||!subQuotaSettingsInputs.size||!subQuotaSettingsStatus)return;
+  if(!subQuotaSettingsForm||!subQuotaSettingsStatus)return;
   const submit=subQuotaSettingsForm.querySelector('[type="submit"]');
   submit.disabled=true;
   setSubQuotaSettingsBusy(true);
@@ -19063,6 +19099,10 @@ async function submitSubQuotaSettings(event){
       apiKeys:inputs.readCredentials?.()||[],
       visible:subQuotaVisibilityValue(inputs.visibilityToggle),
     }));
+    for(const sourceId of subQuotaSettingsRemovedSourceIds){
+      if(!['cpa-codex','sub2api','grok2api','deepseek'].includes(sourceId)||orderedIds.includes(sourceId))continue;
+      sources.push({id:sourceId,provider:sourceId,remove:true});
+    }
     const order=orderedIds;
     const codexAppVisible=subQuotaVisibilityValue(subQuotaSettingsCodexApp?.visibilityToggle);
     const codexAppCreditsVisible=subQuotaVisibilityValue(subQuotaSettingsCodexApp?.creditsVisibilityToggle);
@@ -19079,6 +19119,7 @@ async function submitSubQuotaSettings(event){
 function openSubQuotaSettings(){
   ensureSubQuotaSettingsDialog();
   if(!subQuotaSettingsOverlay)return;
+  subQuotaSettingsRemovedSourceIds=new Set();
   closeComposerPopovers();
   hideSubQuotaPreview();
   if(settingsOverlay&&!settingsOverlay.classList.contains('hidden'))closeSettings();
@@ -19098,6 +19139,7 @@ function closeSubQuotaSettings(){
   subQuotaSettingsOverlay.classList.add('hidden');
   subQuotaToggle?.setAttribute('aria-expanded','false');
   subQuotaSettingsForm?.reset();
+  subQuotaSettingsRemovedSourceIds=new Set();
   if(subQuotaSettingsStatus){subQuotaSettingsStatus.textContent='';subQuotaSettingsStatus.classList.remove('success')}
   syncModalOpenState();
   const returnFocus=subQuotaSettingsReturnFocus||subQuotaToggle;

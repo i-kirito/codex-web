@@ -768,6 +768,25 @@ if (process.argv[2] === 'app-server') {
       ['sub-main-alt-secret', 'sub-main-secret'],
     );
 
+    const deleteBuiltin = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        codexAppVisible: false,
+        sources: deletePayload.sources.map((source) => ({
+          ...source,
+          apiKey: '',
+          remove: source.id === 'deepseek',
+        })),
+        order: ['compat-main', 'sub-empty', 'sub-main'],
+      }),
+    });
+    assert.equal(deleteBuiltin.status, 200);
+    const deleteBuiltinPayload = await deleteBuiltin.json();
+    assert.equal(deleteBuiltinPayload.sources.some((source) => source.id === 'deepseek'), false);
+    const storedAfterBuiltinDelete = JSON.parse(await readFile(sourcesFile, 'utf8'));
+    assert.ok(storedAfterBuiltinDelete.removedBuiltinIds.includes('deepseek'));
+
     await stopServer();
     await rm(path.join(runtime, 'port'), { force: true });
     baseUrl = await startServer();
@@ -780,6 +799,7 @@ if (process.argv[2] === 'app-server') {
     assert.equal(restoredConfigPayload.codexApp.visible, false);
     assert.equal(restoredConfigPayload.codexApp.creditsVisible, false);
     assert.equal(restoredConfigPayload.sources.some((source) => source.id === 'sub_main'), false);
+    assert.equal(restoredConfigPayload.sources.some((source) => source.id === 'deepseek'), false);
     assert.deepEqual(
       restoredConfigPayload.sources.slice(0, 3).map((source) => source.id),
       ['compat-main', 'sub-empty', 'sub-main'],
