@@ -1698,14 +1698,15 @@ body .grok2ApiConsoleIconButton:disabled {
 .subQuotaSettingsForm {
   display: grid;
   min-width: 0;
-  gap: 14px;
+  gap: 16px;
 }
 
 .subQuotaSettingsSourceList {
   display: grid;
   min-height: 0;
   min-width: 0;
-  gap: 10px;
+  gap: 12px;
+  padding: 2px 1px 8px;
 }
 
 .subQuotaSettingsForm .field {
@@ -1721,17 +1722,19 @@ body .grok2ApiConsoleIconButton:disabled {
 .subQuotaSettingsSource {
   display: grid;
   min-width: 0;
-  gap: 12px;
+  gap: 14px;
   border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface-raised);
-  padding: 13px;
-  transition: border-color 140ms var(--ease), background 140ms var(--ease), opacity 140ms var(--ease);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 15px;
+  box-shadow: 0 3px 14px color-mix(in srgb, var(--text) 5%, transparent);
+  transition: border-color 140ms var(--ease), background 140ms var(--ease), box-shadow 140ms var(--ease), opacity 140ms var(--ease);
 }
 
 .subQuotaSettingsSource.isHidden {
   border-style: dashed;
   background: color-mix(in srgb, var(--surface-raised) 72%, transparent);
+  box-shadow: none;
 }
 
 .subQuotaSettingsSourceHead {
@@ -1740,6 +1743,8 @@ body .grok2ApiConsoleIconButton:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  padding-bottom: 11px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
 }
 
 .subQuotaSettingsSourceIdentity {
@@ -1958,10 +1963,19 @@ body .grok2ApiConsoleIconButton:disabled {
   min-width: 0;
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
   gap: 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-raised) 62%, transparent);
+  padding: 11px;
 }
 
 .subQuotaCredentialField {
   align-content: start;
+  min-width: 0;
+  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--surface) 78%, var(--surface-raised));
+  padding: 9px 10px 10px;
 }
 
 .subQuotaCredentialHeader,
@@ -1989,9 +2003,14 @@ body .grok2ApiConsoleIconButton:disabled {
 }
 
 .subQuotaCredentialCount {
+  border: 1px solid color-mix(in srgb, var(--primary) 24%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
   color: var(--text-subtle);
+  padding: 2px 7px;
   font-size: 10px;
   font-variant-numeric: tabular-nums;
+  line-height: 1.2;
 }
 
 .subQuotaCredentialAdd,
@@ -2095,6 +2114,10 @@ body .grok2ApiConsoleIconButton:disabled {
   min-width: 0;
   grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.28fr);
   gap: 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-raised) 62%, transparent);
+  padding: 11px;
 }
 
 .subQuotaManualSourceField,
@@ -2293,9 +2316,19 @@ body .grok2ApiConsoleIconButton:disabled {
 
 
 .subQuotaSettingsFooter {
-  display: grid;
-  gap: 8px;
-  padding-top: 2px;
+  position: sticky;
+  bottom: -18px;
+  z-index: 2;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 2px;
+  padding: 12px 0 18px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  backdrop-filter: blur(10px);
 }
 
 .subQuotaSettingsSubmit {
@@ -2305,6 +2338,7 @@ body .grok2ApiConsoleIconButton:disabled {
 }
 
 .subQuotaSettingsStatus {
+  flex: 1 1 auto;
   min-width: 0;
   min-height: 18px;
   margin: 0;
@@ -13983,6 +14017,7 @@ body .composer > .box:focus-within {
   }
 
   .subQuotaSettingsSource {
+    gap: 12px;
     padding: 12px;
   }
 
@@ -14004,8 +14039,10 @@ body .composer > .box:focus-within {
   }
 
   .subQuotaSettingsSourceActions {
+    width: 100%;
     max-width: 100%;
     flex-wrap: wrap;
+    align-items: center;
     justify-content: flex-end;
     gap: 5px;
   }
@@ -14020,6 +14057,11 @@ body .composer > .box:focus-within {
 
   .subQuotaSettingsFields {
     grid-template-columns: minmax(0, 1fr);
+    padding: 9px;
+  }
+
+  .subQuotaManualSourceFields {
+    padding: 9px;
   }
 
   .subQuotaCredentialRow {
@@ -14080,7 +14122,11 @@ body .composer > .box:focus-within {
 
   .subQuotaSettingsFooter {
     align-items: stretch;
+    bottom: -14px;
+    flex-direction: column;
     grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    padding-bottom: 14px;
   }
 
   .subQuotaSettingsSubmit {
