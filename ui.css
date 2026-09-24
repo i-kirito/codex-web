@@ -1961,7 +1961,7 @@ body .grok2ApiConsoleIconButton:disabled {
 .subQuotaSettingsFields {
   display: grid;
   min-width: 0;
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
   border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
   border-radius: 10px;
