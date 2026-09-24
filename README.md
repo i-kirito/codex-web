@@ -12,6 +12,8 @@
 - 通过持久 `codex app-server` 实现 Web 与 Codex App 双向同步
 - 只显示 Codex App 中未归档的普通用户会话，不显示自动化任务
 - 最近会话按工作目录分组，显示项目名与完整路径
+- 内置官方账号用量分析：直接读取 ChatGPT analytics，展示 Credits、Tokens、缓存命中、每日明细和折算金额，无需 Codex Meter 扩展或快照同步
+- 官方分析需要服务端 Codex 登录凭据；凭据不会返回浏览器。数据按日汇总（起始日整日计入），Credits 按 $0.04 折算，推算周期价值不是实际消费账单；依赖私有接口，失败时不以本机统计冒充官方结果
 - 支持会话改名、归档和历史记录管理
 - 支持从历史用户消息创建原生会话分支，恢复原消息后修改并重新发送
 - 支持流式显示助手回复与思考摘要；历史思考和工具调用默认折叠
@@ -20,12 +22,40 @@
 - 浏览器断开后，已启动的任务会继续在服务端运行
 - 手机切换应用、页面恢复或 SSE 重连时会保留流式消息，并在完整历史落盘后安全同步
 - 支持上传图片、PDF、文本和代码附件
+- 内置 Image Prompt 案例与模板库，支持搜索、预览并发送到生图工作台
+- 内嵌 GPT Image Playground，支持生成、编辑、参考图、遮罩和浏览器本地历史
+- 提供登录保护的生图同源代理，可绕过第三方 Image API 的浏览器 CORS 限制
 - 支持管理模型服务商和默认模型
 - 支持为已有服务商重新获取最新模型列表
 - 支持选择并保存模型思考档位：默认、low、medium、high、xhigh
 - 支持删除服务商，且会防止删除最后一个服务商
 - 支持界面外观设置和自定义聊天背景
+- 内置光粒背景特效与鼠标追随光线，自动适配明暗主题与背景
 - 提供健康检查接口：`/api/health`
+
+## 界面特效
+
+界面内置两层轻量 Canvas 特效，由根目录 `effects.js` 实现，不依赖任何第三方库：
+
+- **光粒特效**：屏幕上漂浮的发光粒子，缓慢漂移并呼吸闪烁，颜色取自当前主题的 `--primary`、`--info`、`--thinking`
+- **鼠标追随光线**：指针移动时产生渐隐的发光拖尾与柔和光晕，光粒会被光标轻微吸引
+
+行为细节：
+
+- 自动跟随明暗主题与 Dream Skin 配色；浅色主题使用普通混合并降低亮度
+- 使用自定义背景或 Dream Skin 壁纸时，特效自动降低透明度，避免干扰背景
+- 尊重系统 `prefers-reduced-motion`，开启时只绘制静态画面
+- 标签页隐藏时暂停渲染，不占用 CPU
+- 画布 `pointer-events: none`，不会拦截点击与滚动
+
+调整效果强弱时，直接修改根目录 `effects.js` 中的参数即可：
+
+- 光粒密度：`spawnParticles()` 中的密度系数 `18000` 与数量上限 `110`
+- 光粒大小与亮度：粒子 `size`、`alpha` 随机范围
+- 拖尾长短与亮度：`TRAIL_MS`、`MAX_TRAIL_POINTS` 以及绘制时的透明度系数
+- 光标光晕亮度：`drawCursorGlow()` 中的透明度数值
+
+修改后重启服务并强制刷新页面（`Ctrl+Shift+R`）即可生效。
 
 ## 环境要求
 
@@ -41,6 +71,72 @@ npm run setup
 ```
 
 `npm run setup` 会生成仅监听 `127.0.0.1` 的 `.env`，自动发现 Codex CLI，并创建随机登录密码和会话密钥。也可以跳过该命令，手动复制并编辑 `.env.example`。
+
+## Docker Compose 部署
+
+适合把 Codex Web 作为独立服务跑在 Docker 里。容器内已安装 Node.js 与 `@openai/codex` CLI；需要把宿主机的 Codex 配置/会话目录挂载到 `/data/codex`，才能读取原生会话。
+
+> 注意：Codex Desktop IPC / 本机 App 窗口联动在容器里通常不可用。容器模式默认关闭 `CODEX_DESKTOP_IPC_ENABLED`，并通过容器内 `codex app-server` 工作。
+
+### 1. 准备环境变量
+
+```bash
+cp .env.docker.example .env
+# 编辑 .env：至少设置 CODEX_WEB_PASSWORD 和 SESSION_SECRET
+```
+
+如果本机已有 Codex 数据，可把 `CODEX_HOME_HOST` 指到真实目录，例如：
+
+```bash
+CODEX_HOME_HOST=$HOME/.codex
+```
+
+### 2. 构建并启动
+
+```bash
+docker compose up -d --build
+docker compose ps
+curl -fsS http://127.0.0.1:36354/api/health
+```
+
+浏览器打开 `http://127.0.0.1:36354`，用 `.env` 中的密码登录。
+
+### 3. 常用命令
+
+```bash
+docker compose logs -f codex-web
+docker compose restart codex-web
+docker compose down
+```
+
+### 4. 发布镜像
+
+默认镜像名：`ikirito9/codex-web:latest`
+
+```bash
+docker build -t ikirito9/codex-web:latest .
+docker push ikirito9/codex-web:latest
+# 或：
+docker compose build
+docker compose push
+```
+
+多架构示例：
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t ikirito9/codex-web:latest --push .
+```
+
+### 数据卷
+
+| 容器路径 | 默认宿主机路径 | 内容 |
+| --- | --- | --- |
+| `/data/codex` | `./data/codex` | Codex 配置、session index、原生会话 |
+| `/data/runtime` | `./data/runtime` | Web 运行时状态、上传、队列 |
+| `/workspaces` | `./data/workspaces` | 默认工作目录 |
+
+真实 `.env`、`data/` 与密钥不要提交到 Git。
 
 ## 配置
 
@@ -70,16 +166,39 @@ cp .env.example .env
 | `SESSION_TTL_HOURS` | 登录有效期，默认 168 小时 |
 | `HOMEPAGE_API_TOKEN` | Homepage 统计接口访问令牌；未设置时接口禁用 |
 | `HOMEPAGE_MODEL_CACHE_SECONDS` | Homepage 模型数量缓存秒数，默认 60 |
+| `CODEX_WEB_QUOTA_MONITOR_TOKEN` | 独立的只读额度监控令牌；设置后启用 `GET /api/monitor/quotas` |
+| `CODEX_WEB_QUOTA_MONITOR_TOKEN_FILE` | 只读额度监控令牌文件；仅在直接令牌未设置时读取，文件权限必须为 `0600` |
+| `CPA_QUOTA_BASE_URL` | CPA Management 地址；与 `CPA_QUOTA_API_KEY` 同时设置后启用 CPA Codex 额度 |
+| `CPA_QUOTA_API_KEY` | CPA Management Key，仅保存在服务端本地 `.env` |
+| `SUB2API_BASE_URL` | Sub2API 地址；旧的单 CPA 配置仍可通过 `SUB_QUOTA_PROVIDER=cpa-codex` 兼容读取 |
+| `SUB2API_API_KEY` | Sub2API API Key；旧的单 CPA Management Key 仍兼容读取 |
+| `SUB2API_ADMIN_API_KEY` | 可选的 Sub2API 管理 API Key；仅在服务端用于补充 Codex 账号 5 小时/7 天额度 |
+| `GROK2API_BASE_URL` | Grok2API 管理面板地址；与 `GROK2API_ADMIN_PASSWORD` 同时设置后启用 Grok2API 额度 |
+| `GROK2API_ADMIN_PASSWORD` | Grok2API 管理员密码（或 `username:password`），仅保存在服务端本地 `.env` |
+| `DEEPSEEK_BASE_URL` | DeepSeek 官方 API 地址，默认 `https://api.deepseek.com` |
+| `DEEPSEEK_API_KEY` | DeepSeek 官方 API Key；设置后启用 DeepSeek 官方余额监控，仅保存在服务端本地 `.env` |
+| `SUB_QUOTA_TIMEOUT_MS` | 额度请求超时，默认 10000 毫秒 |
+| `SUB_QUOTA_CACHE_SECONDS` | 额度结果缓存时间，默认 30 秒 |
+| `CODEX_APP_CREDIT_LIMIT` | 可选的 Codex App 点数总额基准；仅用于把当前剩余点数换算成递减到 0% 的进度条 |
 | `IMAGE_PROMPT_AUTO_SYNC` | 启动时及定时检查 `awesome-gpt-image-2` 更新，默认开启 |
 | `IMAGE_PROMPT_SYNC_INTERVAL_MINUTES` | 提示词库自动检查间隔，默认 360 分钟 |
 | `IMAGE_PROMPT_SYNC_TIMEOUT_MS` | 单次 GitHub 请求超时，默认 20000 毫秒 |
+| `PLAYGROUND_UPDATE_ENABLED` | 是否显示并启用生图工作台一键更新，默认开启 |
 | `IMAGE_PROMPT_GITHUB_TOKEN` | 可选 GitHub Token，仅用于提高 API 速率限制 |
+| `PLAYGROUND_PROXY_TIMEOUT_MS` | 生图工作台同源代理请求超时，默认 690000 毫秒 |
+| `CODEX_WEB_SHUTDOWN_GRACE_MS` | 重启时等待进行中的代理请求完成，默认 120000 毫秒 |
+| `PLAYGROUND_PROXY_ALLOWED_ORIGINS` | 额外允许代理访问的 API Origin，多个值使用英文逗号分隔 |
 | `HOST` | 监听地址，默认 `127.0.0.1` |
 | `PORT` | 固定监听端口，示例为 `36354` |
 | `CODEX_BIN` | Codex CLI 路径；初始化脚本会优先发现 ChatGPT/Codex App 内置版本 |
 | `CODEX_HOME` | Codex 配置、索引和原生会话目录，默认 `$HOME/.codex` |
+| `CODEX_WEB_CWD_MIGRATIONS_FILE` | 可选的工作目录迁移 TSV；仅在显式设置时启用，运行时将旧 `cwd` 映射到新目录 |
+| `CODEX_WEB_LOCAL_IMAGE_ROOTS` | 可选的绝对图片根目录白名单，多个目录用英文逗号分隔；用于显示助手消息中来自其他项目的本地图片 |
+| `CODEX_WEB_LOCAL_FILE_ROOTS` | 可选的绝对文件或目录白名单；白名单内 Markdown 本机文件链接会以已登录的纯文本页面打开 |
 | `APP_SERVER_REQUEST_TIMEOUT_MS` | `codex app-server` 单次协议请求超时，默认 30000 毫秒 |
+| `CODEX_APP_SERVER_PROXY` | 可选的 Codex App Server 网络代理；会同时传递大小写 `HTTP(S)_PROXY` 与 `ALL_PROXY` |
 | `CODEX_DESKTOP_IPC_ENABLED` | macOS/Windows 默认开启；续聊优先交给当前打开任务的 Codex App 窗口 |
+| `CODEX_EXISTING_THREAD_APP_SERVER_FALLBACK` | 找不到 Codex App owner 时是否允许 Web 接管既有会话；桌面 IPC 开启时默认关闭，容器模式默认开启 |
 | `CODEX_DESKTOP_IPC_TIMEOUT_MS` | Codex App 桌面 IPC 请求超时，默认 20000 毫秒 |
 | `CODEX_DESKTOP_IPC_SOCKET` | 可选的桌面 IPC socket/pipe 覆盖路径，通常留空自动发现 |
 | `NATIVE_SESSION_POLL_MS` | 原生会话文件监听的轮询兜底间隔 |
@@ -89,31 +208,106 @@ cp .env.example .env
 | `DEFAULT_SANDBOX` | Codex 默认沙箱模式 |
 | `DEFAULT_APPROVAL` | Codex 默认审批模式 |
 
-本仓库已默认忽略 `.env`、`runtime/` 和 `node_modules/`。请勿手动移除忽略规则或强制提交这些本地敏感/运行时文件。
+当 Codex App 的回合已经进入明确终态、但 App Server 仍留下该线程的 writer lock 时，Web 会在续聊或修改会话设置前先隔离这枚残留锁并重试。仍处于运行中的 App 回合不会被 Web 抢占，以避免双写。
 
-Image Prompt 的案例和模板会保留仓库内置快照作为兜底。自动更新写入 `runtime/image-prompts/`，不会修改已跟踪的 `vendor/` 文件；GitHub 不可用或数据校验失败时继续使用最近一次成功版本。
+### 工作目录迁移
 
-仓库提供以下安全示例，不包含真实凭据或运行数据：
+移动项目目录后，历史会话中保存的旧 `cwd` 可能已经失效。可将 `CODEX_WEB_CWD_MIGRATIONS_FILE` 指向一个本机 TSV 文件，在会话列表、续聊、归档、队列、子代理和工具图片路径中按运行时映射使用新目录。未设置该变量时不会加载任何映射。
 
-- `.env.example`：完整环境变量模板，所有敏感字段均为占位符
-- `runtime.example/`：运行目录结构和脱敏 JSON 示例
-- `node_modules.example/`：依赖目录重建说明；真实依赖请通过 `npm ci` 安装
-
-## 启动
-
-```bash
-npm start
-```
-
-启动后访问：
+TSV 必须包含 `source` 和 `destination` 列；可保留额外列。只有目标目录实际存在的条目会生效，源路径更具体的条目优先：
 
 ```text
-http://localhost:36354
+id	source	destination	category
+my-project	/old/path/my-project	/new/path/my-project	active
 ```
 
-如果 `.env` 中配置了其他端口，请使用对应端口访问。
+该功能不会改写 Codex 的 JSONL、SQLite 或其他历史文件。映射文件通常包含本机路径，应保留在仓库之外。
+
+### 额度监控
+
+左侧额度入口可同时查询本地 CLIProxyAPI（CPA）Codex 账号额度、Sub2API 额度、Grok2API 账号池与 DeepSeek 官方余额。悬停额度图标显示各渠道只读额度卡，点击图标可分别填写各组 URL 与 Key。配置会先保存，额度检测独立刷新，连接或凭证错误不会阻止配置落盘。CPA 通过 `/v0/management/auth-files` 找到 Codex 凭证，再经 `/v0/management/api-call` 请求 `chatgpt.com/backend-api/wham/usage`；Sub2API 通过 `/v1/usage` 读取订阅、余额与 API Key 限速窗口；Grok2API 通过管理面板分别汇总 Build 与 Console 账号池，并展示正常账号、风控、需关注、异常、恢复中、冷却、禁用等账号状态数量。可选设置 `SUB2API_ADMIN_API_KEY` 后，服务端还会读取 `/api/v1/admin/accounts` 中缓存的 Codex 提供商账号 5 小时/7 天使用百分比；管理 Key 不会发送到浏览器。
+
+**DeepSeek 官方额度**：余额通过官方 `GET https://api.deepseek.com/user/balance` 实时查询；官方 API 未开放累计消费/用量查询接口，因此累计 Token 由本服务根据每次实际 API 调用返回的 `usage` 本地累计，仅供参考。可在额度设置的“本地累计校准”中填写官网当前显示的累计 Token 与累计请求，后续调用会从该基准继续累加。统计文件保存在 `runtime/deepseek-usage.json`。
+
+```bash
+CPA_QUOTA_BASE_URL=http://127.0.0.1:8327
+CPA_QUOTA_API_KEY=<replace-with-cpa-management-key>
+SUB2API_BASE_URL=https://sub.example.com
+SUB2API_API_KEY=<replace-with-sub2api-key>
+SUB2API_ADMIN_API_KEY=<optional-sub2api-admin-key>
+GROK2API_BASE_URL=http://127.0.0.1:8100
+GROK2API_ADMIN_PASSWORD=<optional-grok2api-admin-password>
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_API_KEY=<replace-with-deepseek-api-key>
+CODEX_APP_CREDIT_LIMIT=<optional-total-credit-baseline>
+SUB_QUOTA_PROVIDER=multi
+```
+
+各组 URL 与 Key 均可在额度设置弹窗中保存，环境变量仍可用于首次或手工配置。真实 Key 只应写入已忽略的本地 `.env`，不要写入 `.env.example`、README、提交记录或浏览器端代码。点击设置时 Key 输入框不会回显现有值，留空不会替换对应来源的当前 Key。只配置一路时仍会正常显示；多路均配置后会在同一个额度弹层中依次显示。
+
+#### 外部只读额度 API
+
+Hermes 等外部监控可调用 `GET /api/monitor/quotas` 读取与 Web 额度面板相同的服务商额度和 Codex App 点数。该接口使用独立令牌，不接受 Web 登录 Cookie，也不会授予其他 API 的访问权限。可直接设置令牌，或让 Codex Web 与 Hermes 共用一个只保存令牌的 `0600` 文件；两者同时设置时直接令牌优先：
+
+```bash
+# 二选一
+CODEX_WEB_QUOTA_MONITOR_TOKEN=<replace-with-a-random-read-only-token>
+
+# 或使用共享 token 文件，避免在两份 .env 中重复保存明文
+CODEX_WEB_QUOTA_MONITOR_TOKEN_FILE=/absolute/path/to/quota-monitor.token
+chmod 600 /absolute/path/to/quota-monitor.token
+```
+
+请求可使用 `X-API-Token` 或 Bearer：
+
+```bash
+curl -H "X-API-Token: $CODEX_WEB_QUOTA_MONITOR_TOKEN" \
+  http://localhost:36354/api/monitor/quotas
+
+curl -H "Authorization: Bearer $CODEX_WEB_QUOTA_MONITOR_TOKEN" \
+  "http://localhost:36354/api/monitor/quotas?refresh=1"
+```
+
+`refresh=1` 会跳过额度缓存并主动刷新。接口及所有鉴权错误响应都带 `Cache-Control: no-store`；未配置有效令牌时返回 `503`，令牌错误时返回 `401`，非 `GET` 请求返回 `405`。响应不会包含上游 API Key 或管理密码。
+
+### 同源代理
+
+浏览器直接请求第三方 Image API 时，可能因上游拒绝 CORS 预检而显示 `Failed to fetch`。Codex Web 内置登录保护的 `/api-proxy/*` 同源代理，Playground 会把当前浏览器配置的 API URL 作为上游目标，并转发浏览器提供的认证头。
+
+代理只允许以下 API 路径：
+
+- `images/generations`
+- `images/edits`
+- `responses`
+
+允许的上游源站包括：
+
+1. 已配置 Codex Provider 的 Origin。
+2. `PLAYGROUND_PROXY_ALLOWED_ORIGINS` 显式列出的 Origin。
+
+Origin 只包含协议、域名或 IP 和端口，不包含 `/v1` 等路径。例如：
+
+```dotenv
+PLAYGROUND_PROXY_ALLOWED_ORIGINS=https://images.example.com,http://192.168.1.20:8080
+```
+
+代理不会把 Codex Web 登录 Cookie 转发给上游，也不会跟随上游重定向。浏览器填写的 Authorization 会优先转发；只有目标属于已配置 Codex Provider 且浏览器没有提供 Authorization 时，服务端才会回退使用该 Provider 的凭据。未在白名单中的源站和未支持的路径会被拒绝，避免把 Codex Web 变成任意网络代理。
+
+### 提示词库更新
+
+Image Prompt 的案例和模板保留仓库内置快照作为兜底。自动更新写入 `runtime/image-prompts/`，不会修改已跟踪的 `vendor/` 文件；GitHub 不可用或数据校验失败时继续使用最近一次成功版本。可在 `.env` 中使用 `IMAGE_PROMPT_AUTO_SYNC`、`IMAGE_PROMPT_SYNC_INTERVAL_MINUTES` 和 `IMAGE_PROMPT_SYNC_TIMEOUT_MS` 调整更新行为。
+
+能否实际生成图片仍取决于上游账户是否支持所选 Image 模型。网络代理正常但上游返回 `model_not_found` 时，需要在上游配置对应模型或切换到受支持的 Image API。
+
+### 生图工作台更新
+
+生图工作台标题栏的更新图标会检查上游稳定版。点击后，服务端在隔离的临时目录中拉取源码、应用对应的 Codex Web 集成补丁，并依次执行依赖安装、上游测试、生产构建和资源校验；全部通过后才会切换当前版本。更新期间不会覆盖仓库内置的 `vendor/` 快照。
+
+成功构建的当前版本和上一版本分别保存在 `runtime/playground/current/` 与 `runtime/playground/previous/`。切换失败时会自动恢复旧版本；旧页面引用的 hash 资源也可从上一版本回退读取。Docker 部署已持久化 `/data/runtime`，因此容器重建不会丢失已安装版本。设置 `PLAYGROUND_UPDATE_ENABLED=false` 可禁用按钮和更新接口。
 
 ## 模型与服务商
+
+> Codex app-server 不会强制覆盖 `code_mode_host`，而是使用 Codex 自身的功能默认值和配置。`code_mode` 仍是默认关闭的开发中功能；在所用模型工具集明确兼容前不要主动启用，否则可能出现 `code-mode host is disabled` 或 `Unsupported custom tool: 'exec'`。
 
 服务商配置保存在 `CODEX_HOME` 中，API Key 默认保存在 `$CODEX_HOME/.env`。Web 不会在仓库中保存真实密钥。
 
@@ -126,6 +320,8 @@ http://localhost:36354
 5. 如需修改默认值，点击“设为默认模型”。
 
 模型列表来自服务商的 `<base_url>/models` 接口，Web 不会按模型名称过滤。如果上游支持直接调用某个模型但没有在 `/models` 中返回它，该模型不会自动出现在下拉框中。
+
+在 Web 中新增、删除服务商或保存默认模型时，服务端会重载持久 Codex App Server，并在新进程初始化完成后才返回成功，因此新 Base URL、API Key 和模型设置无需重启 Codex Web 即可用于下一次调用。为避免中断会话，存在由 App Server 执行的任务时会拒绝修改并返回 `409`，任务完成后可立即重试。
 
 思考档位：
 
@@ -145,7 +341,7 @@ rg '"type":"turn_context"' "$latest" | tail -1
 
 ## Homepage 小组件
 
-设置 `HOMEPAGE_API_TOKEN` 后，可通过只读接口 `GET /api/homepage/stats` 获取 Codex App 原生会话数、服务商数、默认服务商模型数和运行中任务数。请求必须携带 `X-API-Token` 请求头：
+设置 `HOMEPAGE_API_TOKEN` 后，可通过只读接口 `GET /api/homepage/stats` 获取 Codex App 原生会话数、服务商数、默认服务商模型数、运行中任务数及当前任务名。接口同时返回按开始时间倒序排列的 `runningTasks`，可用于 Homepage 动态列表。请求必须携带 `X-API-Token` 请求头：
 
 ```bash
 curl -H "X-API-Token: $HOMEPAGE_API_TOKEN" http://localhost:36354/api/homepage/stats
@@ -158,25 +354,40 @@ Homepage 的 `services.yaml` 可使用内置 `customapi` 小组件：
     - Codex Web:
         icon: codex-web.svg
         href: http://192.168.10.10:36354
-        widget:
-          type: customapi
-          url: http://192.168.10.10:36354/api/homepage/stats
-          headers:
-            X-API-Token: "替换为 HOMEPAGE_API_TOKEN"
-          mappings:
-            - field: conversations
-              label: 会话
-              format: number
-            - field: providers
-              label: 供应商
-              format: number
-            - field: models
-              label: 模型
-              format: number
-            - field: running
-              label: 运行中
-              format: number
+        widgets:
+          - type: customapi
+            url: http://192.168.10.10:36354/api/homepage/stats
+            headers:
+              X-API-Token: "替换为 HOMEPAGE_API_TOKEN"
+            mappings:
+              - field: conversations
+                label: 会话
+                format: number
+              - field: providers
+                label: 供应商
+                format: number
+              - field: models
+                label: 模型
+                format: number
+              - field: running
+                label: 运行中
+                format: number
+              - field: currentTask
+                label: 当前任务
+                format: text
+          - type: customapi
+            url: http://192.168.10.10:36354/api/homepage/stats
+            headers:
+              X-API-Token: "替换为 HOMEPAGE_API_TOKEN"
+            display: dynamic-list
+            mappings:
+              items: runningTasks
+              name: name
+              label: status
+              limit: 5
 ```
+
+第一个小组件保留统计块并显示最近开始的任务名；第二个动态列表用于展示所有并发运行任务，效果接近 Emby “正在播放”。没有任务运行时，`currentTask` 为“空闲”，`runningTasks` 为空数组。任务数据仅包含名称、状态和开始时间，不包含工作目录、提示正文或会话 ID。
 
 模型数量按当前默认服务商的 `/models` 返回结果统计，并使用短期缓存，避免 Homepage 刷新时频繁访问上游。
 
@@ -200,6 +411,8 @@ Homepage 的 `services.yaml` 可使用内置 `customapi` 小组件：
 - 旧版 Web 会话可能仍保存在 `runtime/conversations.json`，仅作兼容数据保留
 - 上传附件保存在 `runtime/uploads/`
 - 外观设置和自定义背景保存在 `runtime/` 下
+- Image Prompt 自动更新缓存保存在 `runtime/image-prompts/`
+- Playground 的 API 配置、历史和图片数据保存在当前浏览器站点数据中
 - 服务运行日志和临时文件也应保留在本地
 
 这些文件属于本机运行数据，不建议提交到远程仓库。
@@ -232,3 +445,5 @@ npm run check
 提交 Pull Request 前还需要同步最新 `main` 并运行完整检查，具体流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 如服务已在后台运行，修改后需要重启进程才能生效。
+
+> ⚠️ 警告：会话中途不要切换模型，会产生冲突，不稳定。
