@@ -3,6 +3,8 @@ import compression from 'compression';
 import { spawn } from 'child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import {
+  accessSync,
+  constants,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -114,7 +116,7 @@ const CODEX_HOME = resolveLocalPath(process.env.CODEX_HOME || path.join(homedir(
 const readAccountAnalytics = createAccountAnalyticsReader(CODEX_HOME);
 const CODEX_CONFIG_FILE = resolveLocalPath(process.env.CODEX_CONFIG_FILE || path.join(CODEX_HOME, 'config.toml'), CODEX_HOME);
 const CODEX_ENV_FILE = resolveLocalPath(process.env.CODEX_ENV_FILE || path.join(CODEX_HOME, '.env'), CODEX_HOME);
-const CODEX_BIN = process.env.CODEX_BIN || 'codex';
+const CODEX_BIN = resolveCodexExecutable(process.env.CODEX_BIN);
 const CODEX_PROCESS_HOME = resolveLocalPath(process.env.CODEX_PROCESS_HOME || homedir(), homedir());
 const CODEX_APP_QUOTA_RETRY_DELAYS_MS = Object.freeze([0, 350, 1000]);
 const CWD_MIGRATIONS_FILE = resolveCwdMigrationsFile(process.env.CODEX_WEB_CWD_MIGRATIONS_FILE);
@@ -254,6 +256,40 @@ const APP_INTERRUPTED_QUEUE_PAUSE_REASON = 'Interrupted before the steer was acc
 const CAPACITY_AUTO_RETRY_DELAYS_MS = Object.freeze([0, 1000, 2000, 5000, 10000, 20000, 30000, 45000, 60000]);
 const CAPACITY_AUTO_RETRY_STEADY_DELAY_MS = 60000;
 const CAPACITY_AUTO_RETRY_MAX_ATTEMPTS = 50;
+
+function resolveCodexExecutable(configuredValue) {
+  const configured = String(configuredValue || '').trim();
+  if (configured && (configured === 'codex' || !configured.includes('/') || isExecutableFile(configured))) {
+    return configured;
+  }
+
+  const candidates = [
+    '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex',
+    '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+    '/Applications/ChatGPT.app/Contents/Resources/codex',
+    '/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex',
+    '/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+    '/Applications/Codex.app/Contents/Resources/codex',
+  ];
+  const fallback = candidates.find(isExecutableFile);
+  if (fallback) {
+    if (configured && configured !== fallback) {
+      console.warn(`CODEX_BIN 不可用，已切换到 ${fallback}`);
+    }
+    return fallback;
+  }
+
+  return configured || 'codex';
+}
+
+function isExecutableFile(file) {
+  try {
+    accessSync(file, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function capacityAutoRetryDelayMs(attempt) {
   const index = Math.max(0, Math.floor(Number(attempt) || 1) - 1);
