@@ -5,9 +5,10 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 // USD / million tokens, standard short-context API equivalent; not subscription billing.
-// https://developers.openai.com/api/docs/pricing — checked 2026-09-07.
+// https://developers.openai.com/api/docs/pricing — checked 2026-09-27.
 const PRICES = {
-  'gpt-6-astra': [10, 1, 50], 'gpt-5.6-sol': [4, .4, 20],
+  'gpt-6-astra': [10, 1, 50], 'gpt-6-sol': [2, .2, 10], 'gpt-6-luna': [.1, .01, .5],
+  'gpt-5.6-sol': [4, .4, 20],
   'gpt-5.6-terra': [2, .2, 12], 'gpt-5.6-luna': [.2, .02, 1.2],
   'gpt-5.5': [5, .5, 30], 'gpt-5.4': [2.5, .25, 15],
   'gpt-5.4-mini': [.75, .075, 4.5],

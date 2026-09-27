@@ -8,6 +8,8 @@ import { estimateTokenCost } from '../cycle-usage.mjs';
 
 test('API equivalent pricing excludes cached input from normal input and refuses missing data',()=>{
   assert.equal(estimateTokenCost('gpt-6-astra',1000,800,200),.0128);
+  assert.equal(estimateTokenCost('gpt-6-sol',1000,800,200),.00256);
+  assert.equal(estimateTokenCost('gpt-6-luna',1000,800,200),.000128);
   assert.equal(estimateTokenCost('unknown',1000,800,200),null);
   assert.equal(estimateTokenCost('gpt-6-astra',1000,null,200),null);
   assert.equal(estimateTokenCost('gpt-6-astra',1000,1001,200),null);

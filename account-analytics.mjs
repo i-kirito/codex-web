@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 const ORIGIN = 'https://chatgpt.com';
-const USD_PER_CREDIT = 0.04; // Codex Meter's credit-equivalent convention, not a billing record.
+const CREDIT_EQUIVALENT_USD_PER_CREDIT = 0.04; // Display convention only; Credits are not an API or billing currency.
 const number = value => value !== null && value !== '' && Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : null;
 const sum = values => values.every(value => value !== null) ? values.reduce((a, b) => a + b, 0) : null;
 
@@ -40,12 +40,13 @@ export function normalizeAccountAnalytics(data, window, now = Date.now()) {
     outputTokens: sum(daily.map(row => row.outputTokens)), totalTokens: sum(daily.map(row => row.totalTokens)),
     cacheHitPercent: input > 0 && cached !== null && cached <= input ? cached / input * 100 : null,
     turns: sum(daily.map(row => row.turns)),
-    creditEquivalentUsd: credits === null ? null : credits * USD_PER_CREDIT,
-    projectedCredits, projectedUsd: projectedCredits === null ? null : projectedCredits * USD_PER_CREDIT,
+    creditEquivalentUsdPerCredit: CREDIT_EQUIVALENT_USD_PER_CREDIT,
+    creditEquivalentUsd: credits === null ? null : credits * CREDIT_EQUIVALENT_USD_PER_CREDIT,
+    projectedCredits, projectedUsd: projectedCredits === null ? null : projectedCredits * CREDIT_EQUIVALENT_USD_PER_CREDIT,
     remainingPercent: used === null || used > 100 ? null : 100 - used, projectionConfidence,
     daily, fetchedAt: new Date(now).toISOString(),
     scope: '官方账号每日用量；周期起始日整日计入',
-    pricingBasis: 'Credits × $0.04 折算；推算周期额度不等于实际总额度，折算金额非账单扣费',
+    pricingBasis: 'Credits × US$0.04 的 API 等价换算；官方 Credits 不是 API 美元或账单币种，推算周期额度也不等于实际总额度',
   };
 }
 

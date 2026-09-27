@@ -12,12 +12,14 @@ const payload={balance_unit:'credit',group_by:'day',data:[{date:'2026-09-08',tot
 test('native official totals match Meter conventions and do not confuse spent value with projected value',()=>{
   const value=normalizeAccountAnalytics(payload,window,now);
   assert.equal(value.totalTokens,237235370);
+  assert.equal(value.creditEquivalentUsdPerCredit,0.04);
   assert.equal(value.creditEquivalentUsd.toFixed(2),'601.05');
   assert.equal(value.projectedUsd.toFixed(2),'2003.50');
   assert.equal(value.cacheHitPercent.toFixed(2),'96.36');
   assert.equal(value.startDate,'2026-09-08');
   assert.equal(value.remainingPercent,70);
   assert.equal(value.projectionConfidence,'medium');
+  assert.match(value.pricingBasis,/不是 API 美元或账单币种/);
   const noSpend=normalizeAccountAnalytics(payload,{...window,used_percent:0},now);
   assert.equal(noSpend.projectedCredits,null);
   const missing=normalizeAccountAnalytics({...payload,data:[{date:'2026-09-08',totals:{credits:1}}]},window,now);

@@ -18893,8 +18893,9 @@ function codexMeterCompact(value){
   return value.toLocaleString('zh-CN');
 }
 function exportCodexMeter(stats,format){
-  const columns=['日期','Credits','总 Tokens','输入 Tokens','缓存命中 Tokens','输出 Tokens','折算金额','轮数'];
-  const rows=(stats.daily||[]).map(day=>[day.date,day.credits,day.totalTokens,day.inputTokens,day.cachedInputTokens,day.outputTokens,day.credits===null?null:day.credits*0.04,day.turns]);
+  const columns=['日期','Credits','总 Tokens','输入 Tokens','缓存命中 Tokens','输出 Tokens','Credit 等价金额（非账单）','轮数'];
+  const equivalentRate=Number.isFinite(stats.creditEquivalentUsdPerCredit)?stats.creditEquivalentUsdPerCredit:null;
+  const rows=(stats.daily||[]).map(day=>[day.date,day.credits,day.totalTokens,day.inputTokens,day.cachedInputTokens,day.outputTokens,day.credits===null||equivalentRate===null?null:day.credits*equivalentRate,day.turns]);
   const quote=value=>'"'+String(value??'').replaceAll('"','""')+'"';
   const content=format==='json'?JSON.stringify(stats,null,2):[columns,...rows].map(row=>row.map(quote).join(',')).join(String.fromCharCode(10));
   const url=URL.createObjectURL(new Blob([content],{type:format==='json'?'application/json':'text/csv;charset=utf-8'}));
@@ -18910,6 +18911,8 @@ function renderCodexMeter(parent,stats){
   }else{
     const confidence=({low:'低可信',medium:'中可信',high:'高可信'})[stats.projectionConfidence];
     const projection=confidence?confidence+'：每日 Credits ÷ 官方已用比例。':'等待每日 Credits 与官方比例同步。';
+    const equivalentRate=Number.isFinite(stats.creditEquivalentUsdPerCredit)?stats.creditEquivalentUsdPerCredit:null;
+    const equivalentHint=equivalentRate===null?'未提供 Credit 等价换算系数。':'Credits × US$'+equivalentRate.toFixed(2)+' 的 API 等价换算；官方 Credits 不是 API 美元或账单币种。';
     const grid=document.createElement('div');grid.className='codexMeterGrid';
     const metrics=[
       ['gauge','本周期剩余额度比例',fixed(stats.remainingPercent,1)+'%','来自官方每周限额进度。'],
@@ -18917,7 +18920,7 @@ function renderCodexMeter(parent,stats){
       ['cpu','本周期总 Tokens',codexMeterCompact(stats.totalTokens),'按每日用量明细汇总的全部 Tokens。'],
       ['trending-up','推算周总 Credits',confidence?'~'+fixed(stats.projectedCredits,stats.projectedCredits>=1000?0:1):'同步中',projection],
       ['layers','输入缓存命中率',fixed(stats.cacheHitPercent,1)+'%','缓存输入占全部输入 Tokens 的比例。'],
-      ['wallet','推算周价值',confidence?'$ '+fixed(stats.projectedUsd):'同步中',projection],
+      ['wallet','Credit 等价价值（非账单）',confidence&&Number.isFinite(stats.projectedUsd)?'$ '+fixed(stats.projectedUsd):'同步中',equivalentHint],
     ];
     for(const [icon,label,value,hint] of metrics){
       const card=document.createElement('article');card.className='codexMeterCard';
@@ -18929,6 +18932,10 @@ function renderCodexMeter(parent,stats){
       card.append(title,number,description);grid.appendChild(card);
     }
     root.appendChild(grid);
+    if(Number.isFinite(stats.unpricedTokens)&&stats.unpricedTokens>0){
+      const warning=document.createElement('p');warning.className='codexMeterPricingWarning';warning.setAttribute('role','status');
+      warning.textContent=codexMeterCompact(stats.unpricedTokens)+' Tokens 无公开标准 API 单价，未计入金额估算。';root.appendChild(warning);
+    }
     const daily=document.createElement('section');daily.className='codexMeterDaily';
     const dailyHead=document.createElement('div');dailyHead.className='codexMeterDailyHead';
     const title=document.createElement('h4');title.textContent='本周期每日用量';
@@ -18966,8 +18973,9 @@ function appendCodexCycleUsage(parent,stats,{details=false}={}){
     ['已用 Credits',codexMeterCompact(stats.creditsUsed)],
     ['Tokens',codexMeterCompact(stats.totalTokens)],
     ['缓存命中',Number.isFinite(stats.cacheHitPercent)?stats.cacheHitPercent.toFixed(1)+'%':'--'],
-    ['推算周价值',stats.projectionConfidence?usd(stats.projectedUsd):'同步中'],
+    ['Credit 等价价值（非账单）',stats.projectionConfidence?usd(stats.projectedUsd):'同步中'],
   ]:[['官方账号用量',stats.error?'读取失败，点击刷新':stats.loading?'读取中…':'未登录或未提供']];
+  if(stats.available&&Number.isFinite(stats.unpricedTokens)&&stats.unpricedTokens>0)rows.push(['未定价 Tokens',codexMeterCompact(stats.unpricedTokens)]);
   for(const [label,value] of rows){
     const item=document.createElement('div');item.className='subQuotaCredits';
     const caption=document.createElement('span');caption.textContent=label;
