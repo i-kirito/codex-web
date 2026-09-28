@@ -1999,10 +1999,14 @@ app.post('/api/native-sessions/:id/steer', requireAuth, async (req, res) => {
     }
     if (!steer) steer = parseNativeSteerPayload(req.body || {});
     const expectedTurnId = String(req.body?.turnId || active?.turnId || '').trim();
+    const allowWebTakeover = parseBoolean(req.body?.allowWebTakeover, false);
+    const desktopOwnerActive = Boolean(desktopThreadStates.get(threadId)?.ownerClientId);
     const result = await steerNativeTurn(threadId, steer, expectedTurnId, {
-      allowAppServerFallback: CODEX_EXISTING_THREAD_APP_SERVER_FALLBACK
-        || parseBoolean(req.body?.allowWebTakeover, false)
-        || appServerThreadIsLoadedByWeb(threadId),
+      allowAppServerFallback: allowWebTakeover
+        || (!desktopOwnerActive && (
+          CODEX_EXISTING_THREAD_APP_SERVER_FALLBACK
+          || appServerThreadIsLoadedByWeb(threadId)
+        )),
     });
     const turnId = String(result?.turnId || expectedTurnId);
     if (!turnId) throw promptQueueConflict('该会话没有可引导的运行中任务');
@@ -2068,10 +2072,14 @@ app.post('/api/native-sessions/:id/interrupt', requireAuth, async (req, res) => 
     let turnId = turnIdToInterrupt;
     let result;
     try {
+      const allowWebTakeover = parseBoolean(req.body?.allowWebTakeover, false);
+      const desktopOwnerActive = Boolean(desktopThreadStates.get(threadId)?.ownerClientId);
       result = await interruptNativeTurn(threadId, turnId, {
-        allowAppServerFallback: CODEX_EXISTING_THREAD_APP_SERVER_FALLBACK
-          || parseBoolean(req.body?.allowWebTakeover, false)
-          || appServerThreadIsLoadedByWeb(threadId),
+        allowAppServerFallback: allowWebTakeover
+          || (!desktopOwnerActive && (
+            CODEX_EXISTING_THREAD_APP_SERVER_FALLBACK
+            || appServerThreadIsLoadedByWeb(threadId)
+          )),
       });
       turnId = String(result?.interruptedTurnId || turnId);
     } catch (err) {

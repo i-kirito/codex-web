@@ -4,6 +4,7 @@ import {
   createReadStream,
   fstatSync,
   openSync,
+  lstatSync,
   readSync,
   realpathSync,
   statSync,
@@ -18,6 +19,13 @@ const MAX_MP4_BOXES_PER_LEVEL = 16 * 1024;
 const VERIFIED_MEDIA_HANDLES = new WeakSet();
 const CONSUMED_MEDIA_HANDLES = new WeakSet();
 const CLOSED_MEDIA_HANDLES = new WeakSet();
+const MACOS_PRIVATE_ALIASES = Object.freeze(['/var', '/tmp', '/etc']);
+
+function canonicalSystemAliasPath(value) {
+  const input = String(value || '');
+  const alias = MACOS_PRIVATE_ALIASES.find((candidate) => input === candidate || input.startsWith(`${candidate}/`));
+  return alias ? `/private${input}` : input;
+}
 
 export class MessageMediaError extends Error {
   constructor(code, message, options = {}) {
@@ -97,7 +105,27 @@ export function openVerifiedMp4(filePath, options = {}) {
   } catch (cause) {
     throw mediaError('not_found', cause);
   }
-  if (resolvedPath !== lexicalPath) throw mediaError('symlink_path');
+  // macOS exposes /var, /tmp and /etc as stable aliases under /private. Treat
+  // those system aliases as the same path, while still rejecting a symlink in
+  // the file name or any user-controlled parent directory.
+  const canonicalLexicalPath = canonicalSystemAliasPath(lexicalPath);
+  const canonicalResolvedPath = canonicalSystemAliasPath(resolvedPath);
+  if (canonicalResolvedPath !== canonicalLexicalPath) throw mediaError('symlink_path');
+  let parentPath;
+  try {
+    parentPath = realpathSync(path.dirname(lexicalPath));
+  } catch (cause) {
+    throw mediaError('not_found', cause);
+  }
+  if (canonicalSystemAliasPath(parentPath) !== canonicalSystemAliasPath(path.dirname(lexicalPath))) {
+    throw mediaError('symlink_path');
+  }
+  try {
+    if (lstatSync(lexicalPath).isSymbolicLink()) throw mediaError('symlink_path');
+  } catch (error) {
+    if (error instanceof MessageMediaError) throw error;
+    throw mediaError('not_found', error);
+  }
 
   let fd = -1;
   try {
@@ -114,7 +142,7 @@ export function openVerifiedMp4(filePath, options = {}) {
     const currentResolvedPath = realpathSync(lexicalPath);
     const pathnameStats = statSync(currentResolvedPath, { bigint: true });
     if (
-      currentResolvedPath !== lexicalPath
+      canonicalSystemAliasPath(currentResolvedPath) !== canonicalLexicalPath
       || pathnameStats.dev !== descriptorStats.dev
       || pathnameStats.ino !== descriptorStats.ino
     ) throw mediaError('path_changed');
@@ -124,7 +152,7 @@ export function openVerifiedMp4(filePath, options = {}) {
 
     const handle = Object.freeze({
       fd,
-      filePath: resolvedPath,
+      filePath: lexicalPath,
       size,
     });
     VERIFIED_MEDIA_HANDLES.add(handle);

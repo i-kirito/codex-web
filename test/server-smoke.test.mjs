@@ -12615,6 +12615,10 @@ function startServer({
     CODEX_WEB_CWD_MIGRATIONS_FILE: path.join(temporary, 'project-migrations.tsv'),
     CODEX_CONFIG_WRITABLE: configWritable,
     CODEX_DESKTOP_IPC_ENABLED: desktopIpcEnabled,
+    // Keep the fixture deterministic instead of inheriting the developer's
+    // repository .env. Desktop-owned tests must fail closed until takeover is
+    // explicit; IPC-disabled fixtures may exercise the Web fallback path.
+    CODEX_EXISTING_THREAD_APP_SERVER_FALLBACK: desktopIpcEnabled === 'true' ? 'false' : 'true',
     CODEX_DESKTOP_IPC_SOCKET: desktopIpcSocket,
     PLAYGROUND_PROXY_ALLOWED_ORIGINS: playgroundProxyAllowedOrigins,
     CODEX_WEB_LOCAL_IMAGE_ROOTS: localImageRoots,
