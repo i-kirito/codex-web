@@ -194,7 +194,7 @@ cp .env.example .env
 | `CODEX_HOME` | Codex 配置、索引和原生会话目录，默认 `$HOME/.codex` |
 | `CODEX_WEB_CWD_MIGRATIONS_FILE` | 可选的工作目录迁移 TSV；仅在显式设置时启用，运行时将旧 `cwd` 映射到新目录 |
 | `CODEX_WEB_LOCAL_IMAGE_ROOTS` | 可选的绝对图片根目录白名单，多个目录用英文逗号分隔；用于显示助手消息中来自其他项目的本地图片 |
-| `CODEX_WEB_LOCAL_FILE_ROOTS` | 可选的绝对文件或目录白名单；白名单内 Markdown 本机文件链接会以已登录的纯文本页面打开 |
+| `CODEX_WEB_LOCAL_FILE_ROOTS` | 可选的绝对文件或目录白名单；白名单内本机文件链接需登录后打开，HTML 会隔离预览，图片按图片类型返回，其他文本文件以纯文本显示 |
 | `APP_SERVER_REQUEST_TIMEOUT_MS` | `codex app-server` 单次协议请求超时，默认 30000 毫秒 |
 | `CODEX_APP_SERVER_PROXY` | 可选的 Codex App Server 网络代理；会同时传递大小写 `HTTP(S)_PROXY` 与 `ALL_PROXY` |
 | `CODEX_DESKTOP_IPC_ENABLED` | macOS/Windows 默认开启；续聊优先交给当前打开任务的 Codex App 窗口 |

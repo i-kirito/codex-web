@@ -6890,6 +6890,12 @@ function sendAllowedLocalFile(res, requestedPath, { html = false } = {}) {
   res.setHeader('Cache-Control', 'private, no-store');
   res.setHeader('Content-Security-Policy', "default-src 'none'");
   res.setHeader('X-Content-Type-Options', 'nosniff');
+  const imageType = localFileImageMimeType(filePath);
+  if (imageType) {
+    res.type(imageType);
+    setLocalImageSecurityHeaders(res, imageType);
+    return res.sendFile(filePath);
+  }
   if (html) {
     if (/\.html?$/i.test(filePath)) {
       // Run generated pages in an opaque origin, isolated from the Web session.
@@ -6903,6 +6909,21 @@ function sendAllowedLocalFile(res, requestedPath, { html = false } = {}) {
     return res.type('html').send(`<!doctype html><meta charset="utf-8"><title>${escapeHtml(path.basename(filePath))}</title><pre style="white-space:pre-wrap;word-break:break-word">${content}</pre>`);
   }
   return res.type('text/plain').sendFile(filePath);
+}
+
+function localFileImageMimeType(filePath) {
+  const extension = path.extname(filePath).toLowerCase();
+  return ({
+    '.avif': 'image/avif',
+    '.bmp': 'image/bmp',
+    '.gif': 'image/gif',
+    '.ico': 'image/x-icon',
+    '.jpeg': 'image/jpeg',
+    '.jpg': 'image/jpeg',
+    '.png': 'image/png',
+    '.svg': 'image/svg+xml',
+    '.webp': 'image/webp',
+  })[extension] || '';
 }
 
 function decodeLocalFileToken(token) {

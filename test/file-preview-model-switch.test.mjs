@@ -37,6 +37,11 @@ test('HTML file links render an interactive document in an isolated origin; othe
       path, realpathSync, statSync, readFileSync,
       LOCAL_FILE_ROOTS: [dir], LOCAL_FILE_MAX_BYTES: 1024,
       escapeHtml: (value) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;'),
+      setLocalImageSecurityHeaders: (res, type) => {
+        if (type === 'image/svg+xml') {
+          res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; img-src data:");
+        }
+      },
     });
     vm.runInContext(between('function isPathWithinRoot(', '\nfunction decorateNativeConversation('), context);
     const res = response();
@@ -52,6 +57,20 @@ test('HTML file links render an interactive document in an isolated origin; othe
     context.sendAllowedLocalFile(escaped, text, { html: true });
     assert.match(escaped.body, /&lt;script&gt;/);
     assert.equal(escaped.headers['Content-Security-Policy'], "default-src 'none'");
+    const png = path.join(dir, 'preview.png');
+    writeFileSync(
+      png,
+      Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+        'base64',
+      ),
+    );
+    const image = response();
+    context.sendAllowedLocalFile(image, png, { html: true });
+    assert.equal(image.statusCode, 200);
+    assert.equal(image.headers['Content-Type'], 'image/png');
+    assert.equal(image.headers['Content-Security-Policy'], "default-src 'none'");
+    assert.equal(image.headers['X-Content-Type-Options'], 'nosniff');
     const sibling = path.join(dir, 'sibling.html');
     writeFileSync(sibling, document);
     context.LOCAL_FILE_ROOTS = [html];
