@@ -4,24 +4,24 @@ The production files in `app/` were built from:
 
 - Project: `CookSleep/gpt_image_playground`
 - Source: https://github.com/CookSleep/gpt_image_playground
-- Commit: `a10477581b3d43ac98d39777e4445625a9db113d`
-- Version: `0.7.0`
+- Commit: `da4fda85b59ecacc51d6a1e2ef680e3abb9e29b8`
+- Version: `0.7.12`
 - License: MIT, reproduced in `LICENSE`
 
 Rebuild from a clean checkout of the pinned commit:
 
 ```text
 cp vendor/gpt-image-playground/package-lock.json <upstream-checkout>/package-lock.json
-git -C <upstream-checkout> apply <codex-web-checkout>/vendor/gpt-image-playground/patches/codex-web.patch
+git -C <upstream-checkout> apply <codex-web-checkout>/vendor/gpt-image-playground/patches/codex-web-v0.7.12.patch
 cd <upstream-checkout>
 npm ci
-npm run build
+VITE_API_PROXY_AVAILABLE=true npm run build
 rsync -a --delete --exclude sw.js dist/ <codex-web-checkout>/vendor/gpt-image-playground/app/
 ```
 
 The included `package-lock.json` is the upstream lock refreshed with
 `npm audit fix` before building. It pins DOMPurify 3.4.12 and produced a clean
-production dependency audit on 2026-07-17.
+production dependency audit on 2026-07-25.
 
 This embedded build adds a small same-origin bridge in upstream `src/App.tsx`.
 It accepts prompt text, image parameters, and reference images from the Codex
@@ -37,13 +37,27 @@ inserted as an explicit mention.
 When embedded in Codex Web, the build imports a paired image and Agent profile
 from the authenticated `/api/playground-config` endpoint. Gallery requests and
 Agent image tools use the Images API profile, while Agent conversations use the
-Codex provider's Responses API profile. Both profiles refresh their URL and
-credential on each load. The image profile preserves a previously chosen image
-model and initially uses `gpt-image-2`; the Agent profile follows the current
-Codex text model. Codex CLI compatibility mode remains enabled only on the image
-profile, so multi-image requests are split into concurrent single-image calls
-instead of sending an unsupported `n` parameter to Codex-compatible image
-gateways.
+Codex provider's Responses API profile. Server values initialize missing
+profiles, while a URL or credential entered in the Playground settings remains
+authoritative on later loads. The image profile also preserves a previously
+chosen image model and initially uses `gpt-image-2`; the Agent profile follows
+the current Codex text model. Codex CLI compatibility mode remains enabled only
+on the image profile, so multi-image requests are split into concurrent
+single-image calls instead of sending an unsupported `n` parameter to
+Codex-compatible image gateways.
+
+In hybrid Agent mode, an explicit image request now falls back to the paired
+Images API profile when the initial text-planning request fails before any
+tool output is produced. Text-only prompts keep their original error behavior,
+and nested `response.failed.response.error` messages are surfaced instead of a
+generic streaming failure. The embedded build also relies on the host browser's
+native module-preload support, avoiding the iframe MutationObserver polyfill.
+
+The Codex Web build enables the Playground API proxy. Proxied requests include
+the normalized browser-configured API URL as `codex_upstream`; Codex Web only
+forwards supported image and Responses API paths to configured Provider origins
+or origins explicitly listed in `PLAYGROUND_PROXY_ALLOWED_ORIGINS`. Browser
+credentials remain authoritative and browser cookies are never sent upstream.
 
 Codex Web serves this build at `/playground/` behind its existing Web login.
 The upstream caching service worker is replaced with a non-caching shim that

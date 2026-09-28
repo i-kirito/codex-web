@@ -6,14 +6,48 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   CodexDesktopIpcClient,
+  defaultCodexDesktopIpcSocketPath,
+  defaultCodexDesktopIpcSocketPaths,
   isCodexDesktopIpcUnavailableError,
 } from '../desktop-ipc-client.mjs';
+
+test('prefers the Codex home IPC socket and retains the legacy candidate', () => {
+  const options = {
+    codexHome: '/tmp/codex-home-fixture',
+    tmpDir: '/tmp/codex-tmp-fixture',
+    uid: 501,
+  };
+  assert.equal(
+    defaultCodexDesktopIpcSocketPath(options),
+    '/tmp/codex-home-fixture/ipc/ipc.sock',
+  );
+  assert.deepEqual(
+    defaultCodexDesktopIpcSocketPaths(options),
+    [
+      '/tmp/codex-home-fixture/ipc/ipc.sock',
+      '/tmp/codex-tmp-fixture/codex-ipc/ipc-501.sock',
+    ],
+  );
+  assert.equal(
+    defaultCodexDesktopIpcSocketPaths({ ...options, uid: 0 })[1],
+    '/tmp/codex-tmp-fixture/codex-ipc/ipc.sock',
+  );
+
+  const explicit = new CodexDesktopIpcClient({ socketPath: '/tmp/explicit-codex-ipc.sock' });
+  assert.deepEqual(explicit.socketPaths, ['/tmp/explicit-codex-ipc.sock']);
+  explicit.close();
+});
 
 test('routes a turn through the Codex Desktop owner IPC client', async () => {
   const fixture = await createRouterFixture();
   let discoveryResponse;
+  let outboundBroadcastsHandled;
+  const outboundBroadcasts = [];
   const discoveryHandled = new Promise((resolve) => {
     discoveryResponse = resolve;
+  });
+  const allOutboundBroadcastsHandled = new Promise((resolve) => {
+    outboundBroadcastsHandled = resolve;
   });
 
   fixture.onMessage = (socket, message) => {
@@ -44,6 +78,12 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
       return;
     }
 
+    if (message.type === 'broadcast') {
+      outboundBroadcasts.push(message);
+      if (outboundBroadcasts.length === 4) outboundBroadcastsHandled(outboundBroadcasts);
+      return;
+    }
+
     if (message.method === 'thread-follower-command-approval-decision') {
       assert.equal(message.version, 1);
       assert.equal(message.targetClientId, 'desktop-owner-id');
@@ -63,11 +103,41 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
       return;
     }
 
+    if (message.method === 'thread-owner-discovery') {
+      assert.equal(message.version, 1);
+      assert.equal(message.sourceClientId, 'web-client-id');
+      assert.deepEqual(message.params, {
+        hostId: 'local',
+        conversationId: 'thread-1',
+      });
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        handledByClientId: 'desktop-owner-id',
+        result: {},
+      });
+      return;
+    }
+
     assert.equal(message.method, 'thread-follower-start-turn');
-    assert.equal(message.version, 1);
+    assert.equal(message.version, 2);
     assert.equal(message.sourceClientId, 'web-client-id');
-    assert.equal(message.params.conversationId, 'thread-1');
-    assert.equal(message.params.turnStartParams.input[0].text, '同步测试');
+    assert.equal(message.targetClientId, 'desktop-owner-id');
+    assert.deepEqual(message.params, {
+      conversationId: 'thread-1',
+      turnStart: {
+        request: {
+          input: [{ type: 'text', text: '同步测试', text_elements: [] }],
+          threadId: 'thread-1',
+        },
+        context: {
+          attachments: [],
+          commentAttachments: [],
+        },
+      },
+    });
     sendFrame(socket, {
       type: 'response',
       requestId: message.requestId,
@@ -93,6 +163,10 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
       targetClientId: 'desktop-owner-id',
     });
     assert.deepEqual(approval, { ok: true });
+    await client.threadArchived('thread-1', '/workspace/project');
+    await client.threadUnarchived('thread-1', '/workspace/project');
+    await client.threadQueuedFollowUpsChanged('thread-1', [{ id: 'queue-1', text: 'queued prompt' }]);
+    await client.invalidateQueryCache(['archived-threads']);
     assert.deepEqual(await discoveryHandled, {
       type: 'client-discovery-response',
       requestId: 'discovery-1',
@@ -104,6 +178,47 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
       sourceClientId: 'desktop-owner-id',
       params: { conversationId: 'thread-1' },
     });
+    assert.deepEqual(await allOutboundBroadcastsHandled, [
+      {
+        type: 'broadcast',
+        method: 'thread-archived',
+        sourceClientId: 'web-client-id',
+        version: 2,
+        params: {
+          hostId: 'local',
+          conversationId: 'thread-1',
+          cwd: '/workspace/project',
+        },
+      },
+      {
+        type: 'broadcast',
+        method: 'thread-unarchived',
+        sourceClientId: 'web-client-id',
+        version: 1,
+        params: {
+          hostId: 'local',
+          conversationId: 'thread-1',
+          cwd: '/workspace/project',
+        },
+      },
+      {
+        type: 'broadcast',
+        method: 'thread-queued-followups-changed',
+        sourceClientId: 'web-client-id',
+        version: 1,
+        params: {
+          conversationId: 'thread-1',
+          messages: [{ id: 'queue-1', text: 'queued prompt' }],
+        },
+      },
+      {
+        type: 'broadcast',
+        method: 'query-cache-invalidate',
+        sourceClientId: 'web-client-id',
+        version: 0,
+        params: { queryKey: ['archived-threads'] },
+      },
+    ]);
   } finally {
     client.close();
     await fixture.close();
@@ -127,7 +242,7 @@ test('marks a missing Desktop owner as a safe app-server fallback', async () => 
       type: 'response',
       requestId: message.requestId,
       resultType: 'error',
-      error: 'no-client-found',
+      error: 'no-client-found: thread stream owner became unavailable',
     });
   };
 
@@ -141,6 +256,222 @@ test('marks a missing Desktop owner as a safe app-server fallback', async () => 
       client.startTurn('thread-2', { input: [{ type: 'text', text: 'fallback', text_elements: [] }] }),
       (error) => isCodexDesktopIpcUnavailableError(error) && error.reason === 'no-client-found',
     );
+  } finally {
+    client.close();
+    await fixture.close();
+  }
+});
+
+test('bounds owner discovery and identifies the timed out IPC stage', async () => {
+  const fixture = await createRouterFixture();
+  const methods = [];
+  fixture.onMessage = (socket, message) => {
+    methods.push(message.method);
+    if (message.method !== 'initialize') return;
+    sendFrame(socket, {
+      type: 'response',
+      requestId: message.requestId,
+      resultType: 'success',
+      method: message.method,
+      result: { clientId: 'web-client-id' },
+    });
+  };
+
+  const client = new CodexDesktopIpcClient({
+    socketPath: fixture.socketPath,
+    requestTimeoutMs: 1000,
+    ownerDiscoveryTimeoutMs: 40,
+  });
+  const startedAt = Date.now();
+
+  try {
+    await assert.rejects(
+      client.startTurn('thread-owner-timeout', {
+        input: [{ type: 'text', text: 'timeout safely', text_elements: [] }],
+      }),
+      (error) => (
+        error.code === 'CODEX_DESKTOP_IPC_TIMEOUT'
+        && error.desktopIpcMethod === 'thread-owner-discovery'
+      ),
+    );
+    assert.ok(Date.now() - startedAt < 500);
+    assert.deepEqual(methods, ['initialize', 'thread-owner-discovery']);
+  } finally {
+    client.close();
+    await fixture.close();
+  }
+});
+
+test('identifies an unconfirmed start-turn response as distinct from owner discovery', async () => {
+  const fixture = await createRouterFixture();
+  let startRequests = 0;
+  fixture.onMessage = (socket, message) => {
+    if (message.method === 'initialize') {
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        result: { clientId: 'web-client-id' },
+      });
+      return;
+    }
+    if (message.method === 'thread-owner-discovery') {
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        handledByClientId: 'desktop-owner-id',
+        result: {},
+      });
+      return;
+    }
+    assert.equal(message.method, 'thread-follower-start-turn');
+    startRequests += 1;
+  };
+
+  const client = new CodexDesktopIpcClient({
+    socketPath: fixture.socketPath,
+    requestTimeoutMs: 40,
+    ownerDiscoveryTimeoutMs: 40,
+  });
+
+  try {
+    await assert.rejects(
+      client.startTurn('thread-start-timeout', {
+        input: [{ type: 'text', text: 'accepted without response', text_elements: [] }],
+      }),
+      (error) => (
+        error.code === 'CODEX_DESKTOP_IPC_TIMEOUT'
+        && error.desktopIpcMethod === 'thread-follower-start-turn'
+      ),
+    );
+    assert.equal(startRequests, 1);
+  } finally {
+    client.close();
+    await fixture.close();
+  }
+});
+
+test('keeps a Desktop IPC version mismatch distinct from a missing owner', async () => {
+  const fixture = await createRouterFixture();
+  fixture.onMessage = (socket, message) => {
+    if (message.method === 'initialize') {
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: 'initialize',
+        result: { clientId: 'web-client-id' },
+      });
+      return;
+    }
+    if (message.method === 'thread-owner-discovery') {
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        handledByClientId: 'desktop-owner-id',
+        result: {},
+      });
+      return;
+    }
+    sendFrame(socket, {
+      type: 'response',
+      requestId: message.requestId,
+      resultType: 'error',
+      error: 'request-version-mismatch',
+    });
+  };
+
+  const client = new CodexDesktopIpcClient({
+    socketPath: fixture.socketPath,
+    requestTimeoutMs: 1000,
+  });
+
+  try {
+    await assert.rejects(
+      client.startTurn('thread-version-mismatch', {
+        input: [{ type: 'text', text: 'do not fall back', text_elements: [] }],
+      }),
+      (error) => (
+        !isCodexDesktopIpcUnavailableError(error)
+        && error.code === 'request-version-mismatch'
+        && error.reason === 'request-version-mismatch'
+      ),
+    );
+  } finally {
+    client.close();
+    await fixture.close();
+  }
+});
+
+test('routes a steering follow-up with the Desktop restore message contract', async () => {
+  const fixture = await createRouterFixture();
+  let steerMessage;
+  fixture.onMessage = (socket, message) => {
+    if (message.method === 'initialize') {
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        result: { clientId: 'web-client-id' },
+      });
+      return;
+    }
+    assert.equal(message.method, 'thread-follower-steer-turn');
+    assert.equal(message.version, 1);
+    steerMessage = message;
+    sendFrame(socket, {
+      type: 'response',
+      requestId: message.requestId,
+      resultType: 'success',
+      method: message.method,
+      handledByClientId: 'desktop-owner-id',
+      result: { result: { turnId: 'turn-steered-1' } },
+    });
+  };
+
+  const client = new CodexDesktopIpcClient({
+    socketPath: fixture.socketPath,
+    requestTimeoutMs: 1000,
+  });
+  const restoreMessage = {
+    id: 'restore-message-1',
+    text: '队列引导测试',
+    context: {
+      prompt: '队列引导测试',
+      addedFiles: [],
+      fileAttachments: [],
+      ideContext: null,
+      imageAttachments: [],
+      workspaceRoots: ['/tmp/project'],
+      commentAttachments: [],
+    },
+    cwd: '/tmp/project',
+    createdAt: Date.now(),
+  };
+
+  try {
+    const result = await client.steerTurn('thread-1', {
+      input: [{ type: 'text', text: '队列引导测试', text_elements: [] }],
+      restoreMessage,
+      serviceTier: null,
+      attachments: [],
+      clientUserMessageId: 'client-message-1',
+    });
+    assert.equal(result.turnId, 'turn-steered-1');
+    assert.equal(steerMessage.params.conversationId, 'thread-1');
+    assert.deepEqual(steerMessage.params.input, [
+      { type: 'text', text: '队列引导测试', text_elements: [] },
+    ]);
+    assert.equal(steerMessage.params.clientUserMessageId, 'client-message-1');
+    assert.deepEqual(steerMessage.params.restoreMessage, restoreMessage);
+    assert.equal(steerMessage.params.serviceTier, null);
+    assert.deepEqual(steerMessage.params.attachments, []);
   } finally {
     client.close();
     await fixture.close();
@@ -189,6 +520,9 @@ test('routes supported Desktop request responses to the selected owner', async (
   const userInputResponse = { answers: { choice: { answers: ['yes'] } } };
   const permissionsResponse = { permissions: { network: true }, scope: 'turn' };
   const mcpResponse = { action: 'accept', content: { value: 'approved' } };
+  const queuedFollowUpsState = {
+    'thread-3': [{ id: 'queued-1', text: 'queued follow-up' }],
+  };
 
   try {
     await client.loadCompleteHistory('thread-3', options);
@@ -197,6 +531,7 @@ test('routes supported Desktop request responses to the selected owner', async (
     await client.permissionsApprovalResponse('thread-3', 'permissions-1', permissionsResponse, options);
     await client.submitUserInput('thread-3', 'input-1', userInputResponse, options);
     await client.submitMcpElicitationResponse('thread-3', 'mcp-1', mcpResponse, options);
+    await client.setQueuedFollowUpsState('thread-3', queuedFollowUpsState, options);
 
     assert.deepEqual(received, [
       {
@@ -235,7 +570,81 @@ test('routes supported Desktop request responses to the selected owner', async (
         targetClientId: 'desktop-owner-id',
         params: { conversationId: 'thread-3', requestId: 'mcp-1', response: mcpResponse },
       },
+      {
+        method: 'thread-follower-set-queued-follow-ups-state',
+        version: 1,
+        targetClientId: 'desktop-owner-id',
+        params: { conversationId: 'thread-3', state: queuedFollowUpsState },
+      },
     ]);
+  } finally {
+    client.close();
+    await fixture.close();
+  }
+});
+
+test('reconnects after a transient Desktop IPC disconnect', async () => {
+  const fixture = await createRouterFixture();
+  let initializeCount = 0;
+  fixture.onMessage = (socket, message) => {
+    if (message.method === 'initialize') {
+      initializeCount += 1;
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        result: { clientId: `web-client-${initializeCount}` },
+      });
+      return;
+    }
+    if (message.method === 'thread-owner-discovery') {
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        handledByClientId: 'desktop-owner-id',
+        result: {},
+      });
+      return;
+    }
+    assert.equal(message.method, 'thread-follower-load-complete-history');
+    sendFrame(socket, {
+      type: 'response',
+      requestId: message.requestId,
+      resultType: 'success',
+      method: message.method,
+      handledByClientId: 'desktop-owner-id',
+      result: { result: { ok: true, generation: initializeCount } },
+    });
+  };
+
+  const client = new CodexDesktopIpcClient({
+    socketPath: fixture.socketPath,
+    connectTimeoutMs: 500,
+    requestTimeoutMs: 500,
+    reconnectDelaysMs: [10, 20, 40],
+  });
+
+  try {
+    await client.start();
+    assert.equal(initializeCount, 1);
+    const reconnected = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Desktop IPC reconnect timed out')), 1000);
+      client.once('connected', (event) => {
+        clearTimeout(timeout);
+        resolve(event);
+      });
+    });
+    fixture.disconnectClients();
+    const event = await reconnected;
+    assert.equal(event.clientId, 'web-client-2');
+    assert.equal(initializeCount, 2);
+    assert.equal(client.connected, true);
+    assert.deepEqual(await client.loadCompleteHistory('thread-reconnect'), {
+      result: { ok: true, generation: 2 },
+    });
   } finally {
     client.close();
     await fixture.close();
@@ -249,6 +658,9 @@ async function createRouterFixture() {
   const fixture = {
     socketPath,
     onMessage: () => {},
+    disconnectClients() {
+      for (const socket of sockets) socket.destroy();
+    },
     async close() {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));
