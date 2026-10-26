@@ -14,6 +14,42 @@ const between = (start, end) => {
   return source.slice(from, to);
 };
 
+test('malformed session cookies fail closed instead of crashing authenticated routes', () => {
+  const context = vm.createContext({});
+  vm.runInContext(between('function getCookie(', '\nfunction sessionCookie('), context);
+  assert.equal(context.getCookie({ headers: { cookie: 'other=ok; codex_web_session=%' } }, 'codex_web_session'), '');
+  assert.equal(context.getCookie({ headers: { cookie: 'codex_web_session=valid%20token' } }, 'codex_web_session'), 'valid token');
+});
+
+test('runtime JSON state uses atomic persistence for conversations and completion reads', () => {
+  const writes = [];
+  const conversationContext = vm.createContext({
+    CONVERSATIONS_FILE: '/runtime/conversations.json',
+    conversations: [{ id: 'one' }],
+    atomicWriteFile: (...args) => writes.push(args),
+    JSON,
+  });
+  vm.runInContext(between('function saveConversations()', '\nfunction automationSummariesByThreadId('), conversationContext);
+  conversationContext.saveConversations();
+  assert.deepEqual(writes[0], [
+    '/runtime/conversations.json',
+    `${JSON.stringify([{ id: 'one' }], null, 2)}\n`,
+  ]);
+
+  const completionContext = vm.createContext({
+    HISTORY_COMPLETION_READ_FILE: '/runtime/history-completion-read.json',
+    serverHistoryCompletionRead: { thread: 'turn|2026-10-26T00:00:00.000Z' },
+    atomicWriteFile: (...args) => writes.push(args),
+    JSON,
+  });
+  vm.runInContext(between('function writeHistoryCompletionReadFile()', '\nfunction readCodexAppUnreadThreadIds('), completionContext);
+  completionContext.writeHistoryCompletionReadFile();
+  assert.deepEqual(writes[1], [
+    '/runtime/history-completion-read.json',
+    `${JSON.stringify(completionContext.serverHistoryCompletionRead, null, 2)}\n`,
+  ]);
+});
+
 class CapturedResponse extends Writable {
   constructor() {
     super();

@@ -20,8 +20,12 @@ concurrency:
 
 jobs:
   validate:
-    name: validate
-    runs-on: ubuntu-latest
+    name: validate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -60,6 +64,39 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      - name: Build and smoke-test Docker runtime
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker build -t codex-web:ci .
+          container=$(docker run --rm -d \
+            -e CODEX_WEB_PASSWORD=ci-only-password \
+            -e SESSION_SECRET=ci-only-isolated-session-secret \
+            -e CODEX_BIN=/bin/false \
+            -e IMAGE_PROMPT_AUTO_SYNC=false \
+            -e PLAYGROUND_UPDATE_ENABLED=false \
+            codex-web:ci)
+          trap 'docker logs "$container"; docker stop "$container" >/dev/null || true' EXIT
+          for attempt in {1..20}; do
+            if docker exec "$container" curl -fsS http://127.0.0.1:36354/api/health; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec "$container" node --input-type=module -e '
+            const base = "http://127.0.0.1:36354";
+            const login = await fetch(base + "/api/login", {
+              method: "POST", headers: {"content-type": "application/json"},
+              body: JSON.stringify({password: "ci-only-password"}),
+            });
+            if (!login.ok) throw new Error(`Login failed: ${login.status}`);
+            const cookie = login.headers.get("set-cookie").split(";")[0];
+            for (const route of ["/", "/api/config", "/ui.css", "/effects.js", "/image-prompt.js", "/vendor/purify.js"]) {
+              const response = await fetch(base + route, {headers: {cookie}});
+              if (!response.ok) throw new Error(`${route}: ${response.status}`);
+            }
+          '
 
       - name: Check patch whitespace
         if: github.event_name == 'pull_request'

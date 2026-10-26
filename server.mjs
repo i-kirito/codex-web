@@ -333,6 +333,7 @@ const PLAYGROUND_PROXY_ALLOWED_ORIGINS = new Set(
 );
 const NATIVE_THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const JSON_BODY_MAX_BYTES = 36 * 1024 * 1024;
+const LOGIN_JSON_BODY_MAX_BYTES = 4 * 1024;
 const UPLOAD_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 const UPLOAD_FILE_MAX_BYTES = 25 * 1024 * 1024;
 const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1000;
@@ -491,11 +492,25 @@ app.use(compression({
     return compression.filter(req, res);
   },
 }));
-app.use(express.json({ limit: JSON_BODY_MAX_BYTES }));
+const loginJsonParser = express.json({ limit: LOGIN_JSON_BODY_MAX_BYTES });
+const authenticatedJsonParser = express.json({ limit: JSON_BODY_MAX_BYTES });
+app.use((req, res, next) => {
+  // Express routes are case-insensitive and ignore one trailing slash by default.
+  // Keep the small pre-authentication parser aligned with that behavior.
+  if (req.method === 'POST' && /^\/api\/login\/?$/i.test(req.path)) {
+    return loginJsonParser(req, res, next);
+  }
+  if (!validateSession(req)) return next();
+  return authenticatedJsonParser(req, res, next);
+});
 app.use((error, _req, res, next) => {
   if (error?.type === 'entity.too.large') {
     res.setHeader('Cache-Control', 'no-store');
     return res.status(413).json({ error: '请求内容过大' });
+  }
+  if (error?.type === 'entity.parse.failed') {
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(400).json({ error: '请求 JSON 无效' });
   }
   return next(error);
 });
@@ -1093,7 +1108,10 @@ function selectServerHistoryCompletionReadVersion(current, incoming) {
 }
 function writeHistoryCompletionReadFile() {
   try {
-    writeFileSync(HISTORY_COMPLETION_READ_FILE, JSON.stringify(serverHistoryCompletionRead, null, 2));
+    atomicWriteFile(
+      HISTORY_COMPLETION_READ_FILE,
+      `${JSON.stringify(serverHistoryCompletionRead, null, 2)}\n`,
+    );
   } catch {}
 }
 function readCodexAppUnreadThreadIds() {
@@ -8302,7 +8320,12 @@ function getCookie(req, name) {
   const cookie = req.headers.cookie || '';
   for (const part of cookie.split(';')) {
     const [key, ...value] = part.trim().split('=');
-    if (key === name) return decodeURIComponent(value.join('='));
+    if (key !== name) continue;
+    try {
+      return decodeURIComponent(value.join('='));
+    } catch {
+      return '';
+    }
   }
   return '';
 }
@@ -12204,7 +12227,10 @@ function loadConversations() {
 }
 
 function saveConversations() {
-  writeFileSync(CONVERSATIONS_FILE, JSON.stringify(conversations.slice(0, 100), null, 2), { mode: 0o600 });
+  atomicWriteFile(
+    CONVERSATIONS_FILE,
+    `${JSON.stringify(conversations.slice(0, 100), null, 2)}\n`,
+  );
 }
 
 function automationSummariesByThreadId() {
@@ -19386,6 +19412,8 @@ function setNewTaskModeChoice(mode){
   const chatSelected=newTaskModeChoice==='chat';
   newTaskChatTab?.setAttribute('aria-selected',String(chatSelected));
   newTaskWorkTab?.setAttribute('aria-selected',String(!chatSelected));
+  if(newTaskChatTab)newTaskChatTab.tabIndex=chatSelected?0:-1;
+  if(newTaskWorkTab)newTaskWorkTab.tabIndex=chatSelected?-1:0;
   newTaskModeChatSettings?.toggleAttribute('hidden',!chatSelected);
   if(chatSelected)syncNewTaskChatModelOptions();
   if(newTaskModePreviewTitle)newTaskModePreviewTitle.textContent=chatSelected?'聊天':'工作';
@@ -19395,6 +19423,17 @@ function setNewTaskModeChoice(mode){
   const icon=newTaskModePreview?.querySelector('.newTaskModeIcon');
   if(icon)setIconLabel(icon,chatSelected?'message-circle':'briefcase-business','',false);
   if(newTaskModeConfirm)newTaskModeConfirm.textContent=chatSelected?'开始聊天':'开始工作';
+}
+function handleNewTaskModeTabKey(event){
+  if(event.target!==newTaskChatTab&&event.target!==newTaskWorkTab)return;
+  let mode='';
+  if(event.key==='Home')mode='chat';
+  else if(event.key==='End')mode='work';
+  else if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key))mode=event.target===newTaskChatTab?'work':'chat';
+  if(!mode)return;
+  event.preventDefault();
+  setNewTaskModeChoice(mode);
+  (mode==='chat'?newTaskChatTab:newTaskWorkTab)?.focus();
 }
 function openNewTaskModePicker(){
   if(!newTaskModeOverlay)return;
@@ -21017,6 +21056,8 @@ newTaskModeCancel?.addEventListener('click',()=>closeNewTaskModePicker());
 newTaskModeConfirm?.addEventListener('click',confirmNewTaskMode);
 newTaskChatTab?.addEventListener('click',()=>setNewTaskModeChoice('chat'));
 newTaskWorkTab?.addEventListener('click',()=>setNewTaskModeChoice('work'));
+newTaskChatTab?.addEventListener('keydown',handleNewTaskModeTabKey);
+newTaskWorkTab?.addEventListener('keydown',handleNewTaskModeTabKey);
 newTaskModeOverlay?.addEventListener('click',(event)=>{if(event.target===newTaskModeOverlay)closeNewTaskModePicker()});
 newTaskModeDialog?.addEventListener('keydown',(event)=>trapDialogFocus(newTaskModeDialog,event));
 setNewTaskModeChoice('work');
@@ -23922,7 +23963,7 @@ function resetNewTaskComposerCwd(){
 function clearNativeComposerOverride(){nativeComposerOverride=null}
 function resetComposerProviderChange(){composerProviderChangePromise=Promise.resolve(true)}
 async function waitForLatestComposerProviderChange(){let pending;let ready;do{pending=composerProviderChangePromise;ready=await pending.catch(()=>false)}while(pending!==composerProviderChangePromise);return ready}
-async function waitForLatestComposerModelLoad(){let pending;do{pending=composerModelLoadPromise;await pending.catch(()=>false)}while(pending!==composerModelLoadPromise)}
+async function waitForLatestComposerModelLoad(){let pending;let ready;do{pending=composerModelLoadPromise;ready=await pending.catch(()=>false)}while(pending!==composerModelLoadPromise);return ready}
 function rememberNativeComposerOverride({pending=false,writeId=0}={}){
   if(currentConversationSource!=='codex'||!currentConversationId)return;
   nativeComposerOverride={threadId:currentConversationId,provider:String(provider.value||''),model:String(model.value||''),reasoningEffort:String(reasoningEffort.value||''),serviceTier:normalizeComposerServiceTier(composerServiceTier),permissionMode:composerPermissionMode,sandbox:String(sandbox.value||''),approval:String(approval.value||''),pending:Boolean(pending),writeId:Number(writeId)||0};
@@ -24402,9 +24443,16 @@ async function sendLegacyChatMessage(message,attachments=[]){
   const text=String(message||'').trim();
   const uploaded=Array.isArray(attachments)?attachments:[];
   if(!text&&!uploaded.length)return false;
-  await waitForLatestComposerProviderChange();
-  await waitForLatestComposerModelLoad();
   const seq=conversationLoadSeq;
+  const conversationId=currentConversationId;
+  const contextMatches=()=>seq===conversationLoadSeq&&currentConversationSource==='web'&&currentConversationId===conversationId;
+  const providerReady=await waitForLatestComposerProviderChange();
+  const modelReady=await waitForLatestComposerModelLoad();
+  if(!contextMatches())return false;
+  if(providerReady===false||modelReady===false){
+    setTopStatusText('聊天模型尚未准备好，请重新选择后再发送',{running:false});
+    return false;
+  }
   const previousStatus=currentNativeRunStatus;
   const at=new Date().toISOString();
   input.value='';
@@ -25674,23 +25722,53 @@ function enhanceMarkdownImages(body){
   }
   flushRun(run);
 }
+function codexFileCitationDetails(body){
+  const attributes={};
+  const attributePattern=/([A-Za-z][A-Za-z0-9_-]*)=(?:"((?:\\\\.|[^"])*)"|'((?:\\\\.|[^'])*)'|([^\\s]+))/g;
+  let match;
+  while((match=attributePattern.exec(body))){
+    const value=match[2]??match[3]??match[4]??'';
+    attributes[match[1]]=value.replace(/\\\\([\\\\"'])/g,'$1');
+  }
+  const filePath=String(attributes.path||'').trim();
+  if(!filePath.startsWith('/')||filePath.startsWith('//')||filePath.includes(String.fromCharCode(92))
+    ||[0,9,10,13].some((code)=>filePath.includes(String.fromCharCode(code)))
+    ||filePath.includes('?')||filePath.includes('#')||/[<>]/.test(filePath))return null;
+  const fileName=filePath.split(/[\\\\/]/).filter(Boolean).pop()||'下载文件';
+  const label=String(attributes.label||fileName).replace(/[\\u0000-\\u001F\\u007F]/g,' ').slice(0,240)||fileName;
+  return{filePath,label};
+}
 function enhanceCodexFileCitations(source){
   const rawSource=String(source||'');
-  const citationPattern=/::codex-file-citation\\{([^{}\\n]*)\\}/g;
+  const citationPattern=/:{1,2}codex-file-citation\\{([^{}\\n]*)\\}/g;
   return rawSource.replace(citationPattern,(raw,body)=>{
-    const attributes={};
-    const attributePattern=/([A-Za-z][A-Za-z0-9_-]*)=(?:"((?:\\\\.|[^"])*)"|'((?:\\\\.|[^'])*)'|([^\\s]+))/g;
-    let match;
-    while((match=attributePattern.exec(body))){
-      const value=match[2]??match[3]??match[4]??'';
-      attributes[match[1]]=value.replace(/\\\\([\\\\"'])/g,'$1');
-    }
-    const filePath=String(attributes.path||'').trim();
-    if(!filePath.startsWith('/')||filePath.includes('\\n')||filePath.includes('\\r'))return raw;
-    const fileName=filePath.split(/[\\\\/]/).filter(Boolean).pop()||'下载文件';
-    const label=String(attributes.label||fileName).replace(/[\\[\\]]/g,'\\\\$&');
-    return '['+label+'](<'+filePath.replace(/[<>]/g,'')+'>)';
+    const citation=codexFileCitationDetails(body);
+    if(!citation)return raw;
+    const label=citation.label.replace(/\\\\/g,'\\\\\\\\').replace(/[\\[\\]]/g,'\\\\$&');
+    return '['+label+'](<'+citation.filePath+'>)';
   });
+}
+function renderCodexFileCitationFallback(body,source){
+  const rawSource=String(source||'');
+  const citationPattern=/:{1,2}codex-file-citation\\{([^{}\\n]*)\\}/g;
+  const fragment=document.createDocumentFragment();
+  let match,last=0,replaced=false;
+  while((match=citationPattern.exec(rawSource))){
+    const citation=codexFileCitationDetails(match[1]);
+    if(!citation)continue;
+    if(match.index>last)fragment.appendChild(document.createTextNode(rawSource.slice(last,match.index)));
+    const link=document.createElement('a');
+    link.href=citation.filePath;
+    link.textContent=citation.label;
+    fragment.appendChild(link);
+    last=match.index+match[0].length;
+    replaced=true;
+  }
+  if(!replaced)return false;
+  if(last<rawSource.length)fragment.appendChild(document.createTextNode(rawSource.slice(last)));
+  body.replaceChildren(fragment);
+  try{enhanceMarkdownLinks(body)}catch{}
+  return true;
 }
 function renderMessageMarkdown(body,text,{assistantArtifacts=false,messageMedia=null}={}){
   const rawSource=String(text||'');
@@ -25700,7 +25778,7 @@ function renderMessageMarkdown(body,text,{assistantArtifacts=false,messageMedia=
   const source=inboxParsed.markdown;
   const markdownSource=assistantArtifacts?enhanceCodexFileCitations(source):source;
   if(!window.marked?.parse||!window.DOMPurify?.sanitize){
-    body.textContent=source;
+    if(!assistantArtifacts||!renderCodexFileCitationFallback(body,source))body.textContent=source;
     if(inboxParsed.items.length)renderInboxItems(body,inboxParsed.items);
     if(parsed.comments.length)renderReviewComments(body,parsed.comments);
     if(memoryParsed.citations.length)renderMemoryCitations(body,memoryParsed.citations);
@@ -30444,10 +30522,10 @@ async function send(){
     return;
   }
   const providerReady=await waitForLatestComposerProviderChange();
-  await waitForLatestComposerModelLoad();
+  const modelReady=await waitForLatestComposerModelLoad();
   await nativeComposerSettingsQueue.catch(()=>false);
   if(!sendContextMatches())return;
-  if(providerReady===false){statusEl.textContent='服务商模型尚未准备好，请重新选择后再发送';return}
+  if(providerReady===false||modelReady===false){statusEl.textContent='服务商模型尚未准备好，请重新选择后再发送';return}
   const existingId=currentConversationSource==='codex'?currentConversationId:'';
   if(existingId&&webRunActive){
     enqueuePrompt(text,attachments);

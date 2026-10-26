@@ -470,7 +470,7 @@ test('Codex App quota preserves the available reset-card count', async () => {
 
 test('Codex file citations render as safe local-file Markdown links', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
-  const start = serverSource.indexOf('function enhanceCodexFileCitations(source)');
+  const start = serverSource.indexOf('function codexFileCitationDetails(body)');
   const end = serverSource.indexOf('\nfunction renderMessageMarkdown', start);
   assert.ok(start >= 0 && end > start);
   // This helper lives inside the served HTML template literal, so evaluate the
@@ -479,18 +479,45 @@ test('Codex file citations render as safe local-file Markdown links', async () =
   const servedSource = new Function(
     `return ${backtick}${serverSource.slice(start, end)}${backtick};`,
   )();
-  const enhanceCodexFileCitations = new Function(
-    `${servedSource}; return enhanceCodexFileCitations;`,
-  )();
+  const document = {
+    createDocumentFragment: () => ({ children: [], appendChild(node) { this.children.push(node); } }),
+    createTextNode: (text) => ({ nodeType: 3, textContent: text }),
+    createElement: (tagName) => ({ tagName, href: '', textContent: '' }),
+  };
+  const { enhanceCodexFileCitations, renderCodexFileCitationFallback } = new Function(
+    'document',
+    `${servedSource}; return { enhanceCodexFileCitations, renderCodexFileCitationFallback };`,
+  )(document);
   const citation = '::codex-file-citation{path="/Users/ikirito/Outputs/设备清单.xlsx" purpose="output"}';
   assert.equal(
     enhanceCodexFileCitations(`已生成 ${citation}`),
     '已生成 [设备清单.xlsx](</Users/ikirito/Outputs/设备清单.xlsx>)',
   );
   assert.equal(
+    enhanceCodexFileCitations('已生成 :codex-file-citation{path="/Users/ikirito/Outputs/设备清单.xlsx" purpose="output"}'),
+    '已生成 [设备清单.xlsx](</Users/ikirito/Outputs/设备清单.xlsx>)',
+  );
+  assert.equal(
     enhanceCodexFileCitations('::codex-file-citation{path="relative.xlsx"}'),
     '::codex-file-citation{path="relative.xlsx"}',
   );
+  for (const unsafePath of ['//evil.example/report.xlsx', '/\\\\evil.example/report.xlsx', '/tmp/report.xlsx?next=https://evil.example', '/tmp/report.xlsx#fragment']) {
+    const unsafe = `::codex-file-citation{path="${unsafePath}"}`;
+    assert.equal(enhanceCodexFileCitations(unsafe), unsafe);
+  }
+  const injectedLabel = enhanceCodexFileCitations(
+    '::codex-file-citation{path="/tmp/report.xlsx" label="x\\\\](https://evil.example)"}',
+  );
+  assert.doesNotMatch(injectedLabel, /(?<!\\)\]\(https:\/\/evil\.example/);
+  assert.match(injectedLabel, /\(<\/tmp\/report\.xlsx>\)$/);
+  const fallbackBody = {
+    children: [],
+    replaceChildren(fragment) { this.children = fragment.children; },
+  };
+  assert.equal(renderCodexFileCitationFallback(fallbackBody, `已生成 ${citation}`), true);
+  assert.equal(fallbackBody.children[0].textContent, '已生成 ');
+  assert.equal(fallbackBody.children[1].href, '/Users/ikirito/Outputs/设备清单.xlsx');
+  assert.equal(fallbackBody.children[1].textContent, '设备清单.xlsx');
 });
 
 test('server shutdown waits for the Web app-server owner to exit', async () => {
@@ -5981,6 +6008,62 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
     assert.equal(unauthorizedPlayground.status, 401);
 
+    const unauthorizedMalformedJson = await fetch(`${baseUrl}/api/uploads/file`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{',
+    });
+    assert.equal(unauthorizedMalformedJson.status, 401);
+    assert.deepEqual(await unauthorizedMalformedJson.json(), { error: '未登录' });
+
+    const unauthorizedLargeJson = await fetch(`${baseUrl}/api/uploads/file`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: 'A'.repeat(1024 * 1024) }),
+    });
+    assert.equal(unauthorizedLargeJson.status, 401);
+    assert.deepEqual(await unauthorizedLargeJson.json(), { error: '未登录' });
+
+    const unauthorizedChunkedJson = await new Promise((resolve, reject) => {
+      const target = new URL(`${baseUrl}/api/uploads/file`);
+      const request = createHttpRequest({
+        hostname: target.hostname,
+        port: target.port,
+        path: target.pathname,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      }, (response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => { body += chunk; });
+        response.on('end', () => resolve({ status: response.statusCode, body }));
+      });
+      request.on('error', reject);
+      request.write('{"data":"');
+      request.write('A'.repeat(8192));
+      request.end('"}');
+    });
+    assert.equal(unauthorizedChunkedJson.status, 401);
+    assert.deepEqual(JSON.parse(unauthorizedChunkedJson.body), { error: '未登录' });
+
+    const malformedLogin = await fetch(`${baseUrl}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{',
+    });
+    assert.equal(malformedLogin.status, 400);
+    assert.match(malformedLogin.headers.get('cache-control') || '', /no-store/);
+    assert.deepEqual(await malformedLogin.json(), { error: '请求 JSON 无效' });
+
+    const oversizedLogin = await fetch(`${baseUrl}/API/LOGIN/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'A'.repeat(4096) }),
+    });
+    assert.equal(oversizedLogin.status, 413);
+    assert.match(oversizedLogin.headers.get('cache-control') || '', /no-store/);
+    assert.deepEqual(await oversizedLogin.json(), { error: '请求内容过大' });
+
     const initialLoginErrors = [];
     for (let attempt = 0; attempt < 4; attempt += 1) {
       const rejectedLogin = await fetch(`${baseUrl}/api/login`, {
@@ -5993,7 +6076,7 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     }
     assert.deepEqual([...new Set(initialLoginErrors)], ['密码错误']);
 
-    const login = await fetch(`${baseUrl}/api/login`, {
+    const login = await fetch(`${baseUrl}/API/LOGIN/`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ password: 'test-password' }),
@@ -7182,7 +7265,7 @@ updated_at = 1784422800000
     assert.match(page, /async function changeComposerProvider\(nextProvider\)[\s\S]*?syncNativeComposerSettings\(\{provider:requestedProvider,model:model\.value\}\)/);
     assert.match(page, /const settingsReady=await syncNativeComposerSettings[\s\S]*?return settingsReady/);
     assert.match(page, /function requestComposerProviderChange\(nextProvider\)[\s\S]*?composerProviderChangePromise=pending\.catch\(\(\)=>false\)/);
-    assert.match(page, /const providerReady=await waitForLatestComposerProviderChange\(\);\s*await waitForLatestComposerModelLoad\(\);\s*await nativeComposerSettingsQueue\.catch\(\(\)=>false\)/);
+    assert.match(page, /const providerReady=await waitForLatestComposerProviderChange\(\);\s*const modelReady=await waitForLatestComposerModelLoad\(\);\s*await nativeComposerSettingsQueue\.catch\(\(\)=>false\);[\s\S]*?if\(providerReady===false\|\|modelReady===false\)/);
     assert.match(page, /const revision=\+\+modelLoadRevision[\s\S]*?revision!==modelLoadRevision/);
     assert.match(page, /modelListCache\.has\(requestedProvider\)/);
     assert.match(page, /model\.innerHTML='<option value="">获取模型中\.\.\.<\/option>';\s*if\(typeof syncComposerChrome==='function'\)syncComposerChrome\(\)/);

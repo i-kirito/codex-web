@@ -11,6 +11,10 @@ const readSyncSource = source.slice(
   source.indexOf('async function syncHistoryCompletionReadFromServer(){'),
   source.indexOf('function pushHistoryCompletionReadToServer(){'),
 );
+const legacySendSource = source.slice(
+  source.indexOf('async function sendLegacyChatMessage(message,attachments=[]){'),
+  source.indexOf('\nasync function loadConversation(', source.indexOf('async function sendLegacyChatMessage(message,attachments=[]){')),
+);
 
 function sendHarness(initialThreadId = 'A') {
   let respond;
@@ -221,4 +225,39 @@ test('read-state changes during a request produce one follow-up request with the
   assert.equal(env.historyCompletionRead.get('codex:A'), 'done|2026-09-08T01:00:00Z');
   assert.equal(env.historyCompletionSyncInFlight, null);
   assert.equal(timers.size, 0, 'no polling loop after the queued change is reconciled');
+});
+
+test('legacy chat keeps its draft and does not send when the selected model is unavailable', async () => {
+  const requests = [];
+  const attachment = { kind: 'image', url: '/draft.png' };
+  const env = {
+    currentConversationSource: 'web', currentConversationId: '', conversationLoadSeq: 7,
+    webRunActive: false, currentNativeRunStatus: '', pendingAttachments: [attachment],
+    input: { value: 'unsent chat draft', style: {}, scrollHeight: 30 },
+    waitForLatestComposerProviderChange: async () => false,
+    waitForLatestComposerModelLoad: async () => true,
+    setTopStatusText: (text, options) => { env.status = { text, options }; },
+    fetch: (...args) => { requests.push(args); throw new Error('must not send'); },
+  };
+  vm.createContext(env);
+  vm.runInContext(legacySendSource, env);
+  assert.equal(await env.sendLegacyChatMessage(env.input.value, env.pendingAttachments), false);
+  assert.equal(requests.length, 0);
+  assert.equal(env.input.value, 'unsent chat draft');
+  assert.equal(env.pendingAttachments[0], attachment);
+  assert.equal(env.status.text, '聊天模型尚未准备好，请重新选择后再发送');
+  assert.equal(env.status.options.running, false);
+});
+
+test('native send keeps its draft and does not start a turn when model loading fails', async () => {
+  const h = sendHarness('thread-A');
+  let requests = 0;
+  h.env.waitForLatestComposerModelLoad = async () => false;
+  h.env.fetch = () => { requests += 1; throw new Error('must not send'); };
+  assert.equal(await h.env.send(), undefined);
+  assert.equal(requests, 0);
+  assert.equal(h.env.input.value, 'message for A');
+  assert.equal(h.env.pendingAttachments[0], h.originalAttachment);
+  assert.equal(h.env.statusEl.textContent, '服务商模型尚未准备好，请重新选择后再发送');
+  assert.equal(h.env.webRunActive, false);
 });
