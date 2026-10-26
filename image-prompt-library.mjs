@@ -16,6 +16,7 @@ const REVISION_PATTERN = /^[0-9a-f]{40}$/i;
 const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_RETRY_MS = 5 * 60 * 1000;
+const DEFAULT_ASSET_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 
 export class ImagePromptLibrary {
   constructor({
@@ -31,6 +32,7 @@ export class ImagePromptLibrary {
     requestTimeoutMs = DEFAULT_TIMEOUT_MS,
     now = () => new Date(),
     logger = console,
+    assetCacheMaxBytes = DEFAULT_ASSET_CACHE_MAX_BYTES,
   }) {
     if (!cacheDir || !casesFile || !stylesFile) throw new Error('提示词库路径配置不完整');
     if (typeof fetchImpl !== 'function') throw new Error('当前运行环境不支持 fetch');
@@ -50,6 +52,10 @@ export class ImagePromptLibrary {
     this.requestTimeoutMs = finitePositiveNumber(requestTimeoutMs, DEFAULT_TIMEOUT_MS);
     this.now = now;
     this.logger = logger;
+    this.assetCacheMaxBytes = Math.max(0, Number(assetCacheMaxBytes) || 0);
+    this.assetCacheBytes = 0;
+    this.assetCache = new Map();
+    this.assetPending = new Map();
     this.timer = null;
     this.retryTimer = null;
     this.syncPromise = null;
@@ -104,6 +110,103 @@ export class ImagePromptLibrary {
       autoSync: this.autoSync,
       intervalMinutes: Math.round(this.intervalMs / 60_000),
     };
+  }
+
+  resolveAsset(relativePath) {
+    const assetPath = normalizeImagePromptAssetPath(relativePath);
+    if (!assetPath) {
+      const error = new Error('无效的提示词图片路径');
+      error.statusCode = 400;
+      throw error;
+    }
+    const revision = cleanRevision(this.library?.revision || this.syncState.revision || this.builtInRevision)
+      || this.builtInRevision;
+    return {
+      path: assetPath,
+      revision,
+      url: this.rawUrl(revision, `data/${assetPath}`),
+    };
+  }
+
+  async fetchAsset(relativePath, { fetchImpl = this.fetchImpl } = {}) {
+    if (typeof fetchImpl !== 'function') throw new Error('当前运行环境不支持 fetch');
+    const asset = this.resolveAsset(relativePath);
+    const cacheKey = `${asset.revision}:${asset.path}`;
+    const cached = this.assetCache.get(cacheKey);
+    if (cached) {
+      this.assetCache.delete(cacheKey);
+      this.assetCache.set(cacheKey, cached);
+      return cached;
+    }
+    if (this.assetPending.has(cacheKey)) return this.assetPending.get(cacheKey);
+    const pending = this.downloadAsset(asset, fetchImpl).then((downloaded) => {
+      this.cacheAsset(cacheKey, downloaded);
+      return downloaded;
+    }).finally(() => {
+      if (this.assetPending.get(cacheKey) === pending) this.assetPending.delete(cacheKey);
+    });
+    this.assetPending.set(cacheKey, pending);
+    return pending;
+  }
+
+  async downloadAsset(asset, fetchImpl) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    timeout.unref?.();
+    try {
+      const response = await fetchImpl(asset.url, {
+        headers: {
+          Accept: 'image/*,*/*;q=0.8',
+          'User-Agent': 'codex-web-image-prompt-asset',
+        },
+        redirect: 'follow',
+        signal: controller.signal,
+      });
+      if (!response?.ok) {
+        const error = new Error(`提示词图片拉取失败 (${response?.status || 'unknown'})`);
+        error.statusCode = response?.status === 404 ? 404 : 502;
+        throw error;
+      }
+      const body = Buffer.from(await response.arrayBuffer());
+      return {
+        ...asset,
+        status: response.status,
+        contentType: normalizeImagePromptContentType(
+          response.headers?.get?.('content-type'),
+          asset.path,
+        ),
+        cacheControl: 'private, max-age=86400',
+        body,
+      };
+    } catch (error) {
+      if (error?.statusCode) throw error;
+      if (error?.name === 'AbortError') {
+        const timeoutError = new Error('提示词图片拉取超时');
+        timeoutError.statusCode = 504;
+        throw timeoutError;
+      }
+      const failed = new Error(`提示词图片拉取失败: ${cleanError(error)}`);
+      failed.statusCode = 502;
+      throw failed;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  cacheAsset(key, asset) {
+    const bytes = asset?.body?.byteLength || 0;
+    if (!bytes || bytes > this.assetCacheMaxBytes) return;
+    const existing = this.assetCache.get(key);
+    if (existing) this.assetCacheBytes -= existing.body?.byteLength || 0;
+    this.assetCache.delete(key);
+    this.assetCache.set(key, asset);
+    this.assetCacheBytes += bytes;
+    while (this.assetCacheBytes > this.assetCacheMaxBytes && this.assetCache.size) {
+      const oldestKey = this.assetCache.keys().next().value;
+      const oldest = this.assetCache.get(oldestKey);
+      this.assetCache.delete(oldestKey);
+      this.assetCacheBytes -= oldest?.body?.byteLength || 0;
+    }
   }
 
   async sync({ reason = 'manual' } = {}) {
@@ -322,7 +425,9 @@ function createLibraryPayload(data, revision, repository) {
   return {
     version: `${revision}:${styleData.version || 1}:${cases.length}:${templates.length}`,
     revision,
-    imageBaseUrl: `https://raw.githubusercontent.com/${repository}/${revision}/data`,
+    // Browser loads thumbnails same-origin; server proxies GitHub raw assets.
+    imageBaseUrl: '/api/image-prompts/assets',
+    imageUpstreamBaseUrl: `https://raw.githubusercontent.com/${repository}/${revision}/data`,
     totalCases: cases.length,
     totalTemplates: templates.length,
     categories: Array.isArray(styleData.categories) ? styleData.categories : [],
@@ -396,4 +501,33 @@ function cleanError(error) {
 function finitePositiveNumber(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+export function normalizeImagePromptAssetPath(value) {
+  const raw = String(value || '')
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .trim();
+  if (!raw) return '';
+  if (raw.includes('\0')) return '';
+  const parts = raw.split('/').filter(Boolean);
+  if (!parts.length) return '';
+  if (parts.some((part) => part === '.' || part === '..')) return '';
+  if (!parts.every((part) => /^[A-Za-z0-9._-]+$/.test(part))) return '';
+  const joined = parts.join('/');
+  if (!/^images\//.test(joined)) return '';
+  if (!/\.(?:avif|gif|jpe?g|png|webp)$/i.test(joined)) return '';
+  return joined;
+}
+
+export function normalizeImagePromptContentType(contentType, assetPath = '') {
+  const type = String(contentType || '').split(';', 1)[0].trim().toLowerCase();
+  if (type.startsWith('image/')) return type;
+  const lower = String(assetPath || '').toLowerCase();
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.avif')) return 'image/avif';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  return 'application/octet-stream';
 }

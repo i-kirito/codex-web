@@ -56,7 +56,15 @@
     checkingStatus: false,
     syncStatus: null,
     statusTimer: null,
+    playgroundLoadTimer: 0,
+    playgroundSlowTimer: 0,
+    playgroundReadyPoll: 0,
   };
+  const searchTextCache = new WeakMap();
+  const promptCardCache = new Map();
+  let renderedPromptKeys = [];
+  let renderedPromptNodes = [];
+  let searchRenderFrame = 0;
 
   const elements = {};
 
@@ -179,7 +187,7 @@
       </div>
       <div id="imagePromptPlaygroundPanel" class="imagePromptPlaygroundPanel hidden" role="tabpanel" aria-labelledby="imagePromptPlaygroundView">
         <div id="imagePromptPlaygroundLoading" class="imagePromptPlaygroundLoading"><span class="spinner"></span> 正在载入生图工作台</div>
-        <iframe id="imagePromptPlaygroundFrame" class="imagePromptPlaygroundFrame" data-src="/playground/" title="GPT Image Playground 生图工作台" allow="clipboard-read; clipboard-write"></iframe>
+        <iframe id="imagePromptPlaygroundFrame" class="imagePromptPlaygroundFrame" data-src="/playground/?v=fix3" title="GPT Image Playground 生图工作台" allow="clipboard-read; clipboard-write"></iframe>
       </div>
       <div id="imagePromptToast" class="imagePromptToast" role="status" aria-live="polite"></div>
     `;
@@ -290,7 +298,18 @@
     elements.libraryView.addEventListener('click', () => setImagePromptView('library'));
     elements.playgroundView.addEventListener('click', () => setImagePromptView('playground'));
     elements.playgroundFrame.addEventListener('load', () => {
-      elements.playgroundLoading.classList.add('hidden');
+      elements.playgroundFrame.classList.add('loaded');
+      if (elements.playgroundFrame.dataset.bridgeReady !== 'true') {
+        elements.playgroundLoading.classList.remove('hidden');
+        elements.playgroundLoading.innerHTML = '<span class="spinner"></span> 正在初始化生图工作台';
+        startPlaygroundReadyWatch();
+      }
+    });
+    elements.playgroundFrame.addEventListener('error', () => {
+      clearPlaygroundLoadTimer();
+      clearPlaygroundReadyWatch();
+      elements.playgroundLoading.textContent = '生图工作台加载失败，请刷新后重试';
+      elements.playgroundLoading.classList.remove('hidden');
       elements.playgroundFrame.classList.add('loaded');
     });
     window.addEventListener('message', handlePlaygroundBridgeMessage);
@@ -300,7 +319,11 @@
     elements.search.addEventListener('input', () => {
       state.query = elements.search.value.trim();
       state.visible = PAGE_SIZE;
-      renderLibrary();
+      if (searchRenderFrame) cancelAnimationFrame(searchRenderFrame);
+      searchRenderFrame = requestAnimationFrame(() => {
+        searchRenderFrame = 0;
+        renderLibrary();
+      });
     });
     elements.category.addEventListener('change', () => {
       state.category = elements.category.value;
@@ -346,14 +369,21 @@
     document.getElementById('history')?.addEventListener('click', (event) => {
       if (event.target.closest('.histOpen')) setWorkspaceView('codex');
     });
+    window.addEventListener('codex-web:main-view', (event) => {
+      if (event.detail?.view !== 'chat' && state.activeView === 'image-prompts') {
+        setWorkspaceView('codex', { persist: false, focus: false });
+      }
+    });
   }
 
   function setWorkspaceView(view, options = {}) {
     state.activeView = view === 'image-prompts' ? 'image-prompts' : 'codex';
     const promptActive = state.activeView === 'image-prompts';
+    window.dispatchEvent(new CustomEvent('codex-web:workspace-view', { detail: { view: state.activeView } }));
     elements.workspace.classList.toggle('hidden', !promptActive);
     elements.chat.classList.toggle('hidden', promptActive);
     elements.composer.classList.toggle('hidden', promptActive);
+    elements.main.classList.toggle('imagePromptMain', promptActive);
     elements.codexNav.classList.toggle('active', !promptActive);
     elements.promptNav.classList.toggle('active', promptActive);
     elements.codexNav.setAttribute('aria-current', promptActive ? 'false' : 'page');
@@ -365,9 +395,68 @@
       if (typeof closeMenu === 'function') closeMenu();
       setImagePromptView(state.activePromptView, { persist: false });
       void checkLibraryStatus();
-    } else {
+    } else if (options.focus === true) {
       document.getElementById('input')?.focus();
     }
+  }
+
+  function clearPlaygroundLoadTimer() {
+    if (state.playgroundLoadTimer) {
+      clearTimeout(state.playgroundLoadTimer);
+      state.playgroundLoadTimer = 0;
+    }
+    if (state.playgroundSlowTimer) {
+      clearTimeout(state.playgroundSlowTimer);
+      state.playgroundSlowTimer = 0;
+    }
+  }
+
+  function clearPlaygroundReadyWatch() {
+    if (state.playgroundReadyPoll) {
+      clearInterval(state.playgroundReadyPoll);
+      state.playgroundReadyPoll = 0;
+    }
+  }
+
+  function playgroundFrameHasUi() {
+    try {
+      const frameDocument = elements.playgroundFrame.contentDocument;
+      const root = frameDocument?.getElementById('root');
+      return Boolean(root?.childElementCount);
+    } catch {
+      return false;
+    }
+  }
+
+  function startPlaygroundReadyWatch() {
+    clearPlaygroundLoadTimer();
+    clearPlaygroundReadyWatch();
+    if (elements.playgroundFrame.dataset.bridgeReady === 'true') return;
+
+    const checkReady = () => {
+      if (!playgroundFrameHasUi()) return;
+      markPlaygroundReady();
+      flushPlaygroundPrompt();
+    };
+    checkReady();
+    if (elements.playgroundFrame.dataset.bridgeReady === 'true') return;
+
+    state.playgroundReadyPoll = setInterval(checkReady, 100);
+    state.playgroundSlowTimer = setTimeout(() => {
+      if (elements.playgroundFrame.dataset.bridgeReady === 'true') return;
+      elements.playgroundLoading.innerHTML = '<span class="spinner"></span> 加载较慢，仍在初始化生图工作台…';
+    }, 1200);
+    state.playgroundLoadTimer = setTimeout(() => {
+      markPlaygroundReady();
+    }, 3500);
+  }
+
+  function markPlaygroundReady() {
+    clearPlaygroundLoadTimer();
+    clearPlaygroundReadyWatch();
+    elements.playgroundFrame.dataset.bridgeReady = 'true';
+    elements.playgroundLoading.classList.add('hidden');
+    elements.playgroundFrame.classList.add('loaded');
   }
 
   function setImagePromptView(view, options = {}) {
@@ -389,7 +478,16 @@
     if (elements.playgroundFrame.dataset.loaded !== 'true') {
       elements.playgroundFrame.dataset.loaded = 'true';
       elements.playgroundFrame.dataset.bridgeReady = 'false';
-      elements.playgroundFrame.src = elements.playgroundFrame.dataset.src;
+      clearPlaygroundLoadTimer();
+      elements.playgroundLoading.innerHTML = '<span class="spinner"></span> 正在载入生图工作台';
+      elements.playgroundLoading.classList.remove('hidden');
+      elements.playgroundFrame.classList.add('loaded');
+      const source = elements.playgroundFrame.dataset.src || '/playground/';
+      elements.playgroundFrame.src = source;
+      startPlaygroundReadyWatch();
+    } else if (elements.playgroundFrame.dataset.bridgeReady !== 'true') {
+      elements.playgroundLoading.classList.remove('hidden');
+      startPlaygroundReadyWatch();
     }
     flushPlaygroundPrompt();
   }
@@ -407,6 +505,7 @@
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '提示词库载入失败');
       state.library = data;
+      prunePromptCardCache(data);
       populateLibraryChrome();
       renderLibrary();
       return Boolean(previousVersion && previousVersion !== data.version);
@@ -580,18 +679,53 @@
       if (state.category && item.category !== state.category) return false;
       if (state.favoritesOnly && !state.favorites.has(itemKey(type, item))) return false;
       if (!query) return true;
-      const searchable = [
-        itemTitle(item),
-        itemDescription(item),
-        item.prompt,
-        item.promptPreview,
-        item.category,
-        ...(item.styles || []),
-        ...(item.scenes || []),
-        ...(item.tags || []),
-      ].filter(Boolean).join(' ').toLocaleLowerCase();
+      let searchable = searchTextCache.get(item);
+      if (searchable === undefined) {
+        searchable = [
+          itemTitle(item),
+          itemDescription(item),
+          item.prompt,
+          item.promptPreview,
+          item.category,
+          ...(item.styles || []),
+          ...(item.scenes || []),
+          ...(item.tags || []),
+        ].filter(Boolean).join(' ').toLocaleLowerCase();
+        searchTextCache.set(item, searchable);
+      }
       return searchable.includes(query);
     });
+  }
+
+  function promptCardSignature(type, item) {
+    return JSON.stringify([
+      type, itemTitle(item), itemDescription(item), item.prompt, item.promptPreview,
+      item.category, item.image, item.cover, item.imageAlt,
+      item.styles || [], item.tags || [],
+    ]);
+  }
+
+  function prunePromptCardCache(library) {
+    const valid = new Set([
+      ...(library?.cases || []).map((item) => itemKey('case', item)),
+      ...(library?.templates || []).map((item) => itemKey('template', item)),
+    ]);
+    for (const key of promptCardCache.keys()) {
+      if (!valid.has(key)) promptCardCache.delete(key);
+    }
+  }
+
+  function reusablePromptCard(type, item) {
+    const key = itemKey(type, item);
+    const signature = promptCardSignature(type, item);
+    let cached = promptCardCache.get(key);
+    if (!cached || cached.item !== item || cached.signature !== signature) {
+      cached = { item, signature, node: createPromptCard(item) };
+      promptCardCache.set(key, cached);
+    }
+    const favorite = cached.node._favoriteButton;
+    favorite?.classList.toggle('active', state.favorites.has(key));
+    return cached.node;
   }
 
   function renderLibrary() {
@@ -599,10 +733,28 @@
     elements.loading.classList.add('hidden');
     const items = filteredItems();
     const visible = items.slice(0, state.visible);
-    elements.grid.replaceChildren();
-    const fragment = document.createDocumentFragment();
-    for (const item of visible) fragment.appendChild(createPromptCard(item));
-    elements.grid.appendChild(fragment);
+    const type = state.mode === 'templates' ? 'template' : 'case';
+    const nextKeys = visible.map((item) => itemKey(type, item));
+    const nextNodes = visible.map((item) => reusablePromptCard(type, item));
+    const appendOnly = renderedPromptKeys.length < nextKeys.length
+      && renderedPromptKeys.every((key, index) => key === nextKeys[index])
+      && renderedPromptNodes.every((node, index) => node === nextNodes[index])
+      && elements.grid.children.length === renderedPromptKeys.length;
+    if (appendOnly) {
+      const fragment = document.createDocumentFragment();
+      for (let index = renderedPromptKeys.length; index < nextNodes.length; index += 1) {
+        fragment.appendChild(nextNodes[index]);
+      }
+      elements.grid.appendChild(fragment);
+    } else if (nextKeys.length !== renderedPromptKeys.length
+      || nextKeys.some((key, index) => key !== renderedPromptKeys[index])
+      || nextNodes.some((node, index) => node !== renderedPromptNodes[index])) {
+      const all = document.createDocumentFragment();
+      for (const node of nextNodes) all.appendChild(node);
+      elements.grid.replaceChildren(all);
+    }
+    renderedPromptKeys = nextKeys;
+    renderedPromptNodes = nextNodes;
     elements.empty.classList.toggle('hidden', items.length > 0);
     elements.resultCount.textContent = `${items.length} 条${state.mode === 'templates' ? '模板' : '案例'}`;
     elements.loadMore.classList.toggle('hidden', visible.length >= items.length);
@@ -662,6 +814,7 @@
     const copy = createIconButton('copy', '复制提示词');
     copy.addEventListener('click', () => copyText(itemPrompt(type, item)));
     const favorite = createIconButton('heart', '收藏提示词');
+    article._favoriteButton = favorite;
     favorite.classList.toggle('active', state.favorites.has(itemKey(type, item)));
     favorite.addEventListener('click', () => toggleFavorite(type, item));
     actions.appendChild(tags);
@@ -877,7 +1030,7 @@
     const message = event.data;
     if (!message || typeof message !== 'object') return;
     if (message.type === 'codex-web:playground-ready') {
-      elements.playgroundFrame.dataset.bridgeReady = 'true';
+      markPlaygroundReady();
       flushPlaygroundPrompt();
       return;
     }
