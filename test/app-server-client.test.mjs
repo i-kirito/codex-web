@@ -480,6 +480,41 @@ test('stop force kills an app-server that ignores SIGTERM', async () => {
   }
 });
 
+test('a real child stdin stream error is handled and terminates the broken connection', async () => {
+  const fixture = await createLifecycleFixture();
+  const { client } = fixture;
+  let child;
+  try {
+    await client.request('ping');
+    child = client.child;
+    const exits = [];
+    client.on('exit', (error) => exits.push(error));
+
+    const error = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    const childClosed = new Promise((resolve) => child.once('close', resolve));
+    child.stdin.emit('error', error);
+    await childClosed;
+
+    assert.equal(client.child, null);
+    assert.equal(client.initialized, false);
+    assert.strictEqual(exits[0], error);
+    const trace = await fixture.readTrace();
+    assert.ok(trace.some((entry) => entry.event === 'sigterm' && entry.pid === child.pid));
+    const recovered = await client.request('ping');
+    assert.notEqual(recovered.pid, child.pid);
+    const replacement = client.child;
+    child.stdin.emit('error', Object.assign(new Error('late old EPIPE'), { code: 'EPIPE' }));
+    assert.strictEqual(client.child, replacement, 'a delayed old stream error cannot drop the replacement');
+    assert.equal(client.initialized, true);
+  } finally {
+    if (child?.exitCode === null && child?.signalCode === null) child.kill('SIGTERM');
+    if (child?.exitCode === null && child?.signalCode === null) {
+      await new Promise((resolve) => child.once('close', resolve));
+    }
+    await fixture.cleanup();
+  }
+});
+
 test('inbound request callbacks cannot respond through a replacement connection', () => {
   const client = new CodexAppServerClient();
   const oldWrites = [];

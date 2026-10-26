@@ -368,6 +368,20 @@ export class CodexAppServerClient extends EventEmitter {
     this.connectionGeneration = generation;
     this.child = child;
 
+    // A child can close its read end before Node observes the process close.
+    // stdin.write then reports EPIPE asynchronously on the stream; without a
+    // listener that error is uncaught and can terminate the whole Web server.
+    child.stdin.on('error', (error) => {
+      // Ignore a delayed error from a connection that has already been
+      // replaced. Its existing shutdown path still owns that old process.
+      if (this.child !== child) return;
+      this.handleChildFailure(child, error);
+      // A process may close only stdin and remain alive. Once its RPC channel
+      // is broken, terminate it so dropping this.child cannot orphan it.
+      if (child.exitCode === null && child.signalCode === null) {
+        try { child.kill('SIGTERM'); } catch {}
+      }
+    });
     child.stdout.on('data', (chunk) => this.consumeStdout(child, generation, chunk));
     child.stderr.on('data', (chunk) => this.emit('stderr', chunk.toString()));
     child.on('error', (error) => this.handleChildFailure(child, error));
