@@ -3383,6 +3383,59 @@ test('terminal App writer locks are quarantined before Web settings takeover', a
   ]);
 });
 
+test('an empty fork may quarantine an old unlocked writer lock without a terminal event', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function quarantineIdleNativeThreadWriterLock');
+  const helperEnd = serverSource.indexOf('\nfunction discardQuarantinedNativeThreadWriterLock', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const renames = [];
+  const conversation = {
+    status: 'done',
+    latestTurnId: '',
+    revision: 'empty-fork-revision',
+    messages: [],
+  };
+  const api = new Function(
+    'cleanNativeThreadId',
+    'nativeSessions',
+    'activeNativeTurns',
+    'nativeConversationHasExplicitTerminal',
+    'path',
+    'CODEX_HOME',
+    'statSync',
+    'NATIVE_THREAD_WRITER_LOCK_TAKEOVER_MIN_AGE_MS',
+    'randomBytes',
+    'quarantineUnlockedWriterLock',
+    `${serverSource.slice(helperStart, helperEnd)}; return { quarantineIdleNativeThreadWriterLock };`,
+  )(
+    (value) => String(value || '').trim(),
+    { get: () => conversation },
+    new Map(),
+    () => false,
+    path,
+    '/tmp/codex-home',
+    () => ({ isFile: () => true, size: 0, mtimeMs: Date.now() - 6000 }),
+    5000,
+    () => Buffer.from('1234'),
+    (source, target) => { renames.push([source, target]); return true; },
+  );
+
+  const repair = api.quarantineIdleNativeThreadWriterLock('empty-thread');
+  assert.ok(repair);
+  assert.equal(renames.length, 1);
+  assert.equal(renames[0][0], '/tmp/codex-home/thread-writer-locks/empty-thread.lock');
+  conversation.status = 'running';
+  assert.equal(api.quarantineIdleNativeThreadWriterLock('empty-thread'), null);
+  conversation.status = 'done';
+  conversation.messages = [{ kind: 'task_started' }];
+  assert.equal(api.quarantineIdleNativeThreadWriterLock('empty-thread'), null);
+  conversation.messages = [];
+  conversation.latestTurnId = 'unfinished-turn';
+  assert.equal(api.quarantineIdleNativeThreadWriterLock('empty-thread'), null);
+  assert.equal(renames.length, 1);
+});
+
 test('Desktop handoff stops when Web subscription release is not confirmed', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const helperStart = serverSource.indexOf('async function continueNativeTurn');
@@ -5284,6 +5337,7 @@ experimental_bearer_token = "switch-test-token"
     stateDb.close();
     await writeFile(fakeCodex, `#!/usr/bin/env node
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 const args = process.argv.slice(2);
 if (args.includes('--version')) {
   console.log('codex-cli test');
@@ -5438,7 +5492,7 @@ if (args[0] === 'app-server') {
         send({ id: message.id, result: { data: latestTurn ? [latestTurn] : [] } });
       }
       else if (message.method === 'turn/start') {
-        const turnId = '019f4f84-ea9f-73c2-b997-deba7b4aa798';
+        const turnId = randomUUID();
         const text = (message.params.input || []).find((item) => item.type === 'text')?.text || '';
         const control = archiveControl();
         if (String(control.failTurnStartText || '') && text.includes(String(control.failTurnStartText))) {
@@ -5542,7 +5596,11 @@ if (args[0] === 'app-server') {
         const turnId = String(message.params.turnId || '');
         const latestTurn = latestTurnsByThread.get(threadId);
         if (latestTurn?.id === turnId) {
-          latestTurnsByThread.set(threadId, { ...latestTurn, status: 'interrupted' });
+          const turn = { ...latestTurn, status: 'interrupted' };
+          latestTurnsByThread.set(threadId, turn);
+          // Confirm only turns actually owned by this fixture. Unknown Desktop
+          // turns still get just an ACK and exercise pending-terminal recovery.
+          send({ method: 'turn/completed', params: { threadId, turn } });
         }
         send({ id: message.id, result: {} });
       }
@@ -7940,8 +7998,13 @@ updated_at = 1784422800000
     assert.equal(composerLabels.composerModelLabel('gpt-5.6-sol'), '5.6 Sol');
     assert.equal(composerLabels.composerModelLabel('deepseek-v4-flash'), 'DeepSeek V4 Flash');
     assert.equal(composerLabels.composerModelLabel('grok-4.5'), 'Grok 4.5');
-    assert.equal(composerLabels.composerEffortLabel('xhigh'), '极高');
-    assert.equal(composerLabels.composerEffortLabel('ultra'), '超高');
+    assert.equal(composerLabels.composerEffortLabel(''), '默认');
+    assert.equal(composerLabels.composerEffortLabel('low'), '轻度 (low)');
+    assert.equal(composerLabels.composerEffortLabel('medium'), '中 (medium)');
+    assert.equal(composerLabels.composerEffortLabel('high'), '高 (high)');
+    assert.equal(composerLabels.composerEffortLabel('xhigh'), '极高 (xhigh)');
+    assert.equal(composerLabels.composerEffortLabel('max'), '最高 (max)');
+    assert.equal(composerLabels.composerEffortLabel('ultra'), '超高 (ultra)');
     assert.equal(composerLabels.composerMaximumEffortValue({ options: [
       { value: '' },
       { value: 'xhigh' },
@@ -11477,12 +11540,17 @@ updated_at = 1784422800000
       threadStartId: runningSideChatId,
       failArchiveThreadId: runningSideChatId,
     }));
+    // The preceding duplicate-queue case disables the Desktop owner. This case
+    // explicitly verifies Desktop interrupt before a controlled archive failure.
+    const sideChatDesktopOwnerAvailable = desktopIpc.ownerAvailable;
+    desktopIpc.ownerAvailable = true;
     const closeRunningSideChat = await fetch(`${baseUrl}/api/native-sessions/${runningSideChatId}`, {
       method: 'DELETE',
       headers: { Cookie: cookie },
     });
-    assert.equal(closeRunningSideChat.status, 502);
-    assert.match((await closeRunningSideChat.json()).error, /controlled thread\/archive failure/);
+    const closeRunningSideChatPayload = await closeRunningSideChat.json();
+    assert.equal(closeRunningSideChat.status, 502, closeRunningSideChatPayload.error);
+    assert.match(closeRunningSideChatPayload.error, /controlled thread\/archive failure/);
     assert.ok(desktopIpc.messages.some((message) => (
       message.method === 'thread-follower-interrupt-turn'
       && message.params?.conversationId === runningSideChatId
@@ -11508,6 +11576,7 @@ updated_at = 1784422800000
       { method: 'POST', headers: { Cookie: cookie } },
     );
     assert.equal(restoredRunningSideChat.status, 200);
+    desktopIpc.ownerAvailable = sideChatDesktopOwnerAvailable;
 
     const failedSideChatId = '019f4f84-ea9f-73c2-b997-deba7b4aa741';
     const queueBeforeFailedSideChat = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
@@ -11657,7 +11726,8 @@ updated_at = 1784422800000
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ turnId: createdPayload.turnId }),
     });
-    assert.equal(interrupted.status, 200);
+    const interruptedPayload = await interrupted.json();
+    assert.equal(interrupted.status, 200, JSON.stringify(interruptedPayload));
     const createdInterruptTrace = await waitForAppServerTrace(
       appServerTraceFile,
       (messages) => messages.filter((message) => (
@@ -11709,12 +11779,16 @@ updated_at = 1784422800000
     assert.equal(updatedThreadSettingsPayload.provider, 'switchtest');
     assert.equal(updatedThreadSettingsPayload.model, 'switch-model');
     assert.equal(updatedThreadSettingsPayload.reasoningEffort, 'xhigh');
-    const threadSettingsProtocol = (await readFile(appServerTraceFile, 'utf8'))
-      .trim()
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => JSON.parse(line))
-      .slice(protocolBeforeThreadSettingsUpdate.length);
+    // The successful response is sent before the handler's async finally releases
+    // its subscription. Wait for that observable cleanup, not a scheduling race.
+    const threadSettingsProtocol = (await waitForAppServerTrace(
+      appServerTraceFile,
+      (messages) => messages.slice(protocolBeforeThreadSettingsUpdate.length).some((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === createdNativeSessionId
+      )),
+      'settings update did not release the temporary Web subscription',
+    )).slice(protocolBeforeThreadSettingsUpdate.length);
     assert.ok(threadSettingsProtocol.some((message) => message.type === 'process_env'));
     const threadSettingsCalls = threadSettingsProtocol
       .filter((message) => ['thread/resume', 'thread/settings/update'].includes(message.method));
@@ -11831,6 +11905,10 @@ updated_at = 1784422800000
     });
     assert.equal(approved.status, 200);
 
+    // This archive case verifies the Desktop interrupt route, unlike the
+    // preceding approval case which deliberately runs without a Desktop owner.
+    const projectArchiveDesktopOwnerAvailable = desktopIpc.ownerAvailable;
+    desktopIpc.ownerAvailable = true;
     const interruptCountBeforeRunningArchive = desktopIpc.messages.filter((message) => (
       message.method === 'thread-follower-interrupt-turn'
       && message.params?.conversationId === nativeSessionId
@@ -11840,8 +11918,8 @@ updated_at = 1784422800000
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ cwd: temporary }),
     });
-    assert.equal(runningProjectArchive.status, 200);
     const runningProjectArchivePayload = await runningProjectArchive.json();
+    assert.equal(runningProjectArchive.status, 200, JSON.stringify(runningProjectArchivePayload));
     assert.deepEqual(runningProjectArchivePayload.archived, [nativeSessionId]);
     assert.equal(
       desktopIpc.messages.filter((message) => (
@@ -11894,7 +11972,8 @@ updated_at = 1784422800000
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ turnId: mismatchedProviderPayload.turnId }),
     });
-    assert.equal(mismatchedInterrupted.status, 200);
+    const mismatchedInterruptedPayload = await mismatchedInterrupted.json();
+    assert.equal(mismatchedInterrupted.status, 200, JSON.stringify(mismatchedInterruptedPayload));
 
     const archivedProject = await fetch(`${baseUrl}/api/native-projects/archive`, {
       method: 'POST',
@@ -11912,6 +11991,7 @@ updated_at = 1784422800000
       && message.params?.conversationId === nativeSessionId
       && message.params?.cwd === temporary
     )));
+    desktopIpc.ownerAvailable = projectArchiveDesktopOwnerAvailable;
 
     const rejectedDeleteAll = await fetch(`${baseUrl}/api/native-archived-sessions`, {
       method: 'DELETE',
