@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { appendFile, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -16,6 +16,214 @@ test('native session store uses a five-second fallback poll by default', async (
     await mkdir(codexHome, { recursive: true });
     store = new NativeSessionStore(codexHome, { watchChanges: false });
     assert.equal(store.pollIntervalMs, 5000);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('unchanged side-chat state is not rewritten by fallback refreshes', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-side-state-'));
+  const sideChatStateFile = path.join(temporary, 'runtime', 'side-chat.json');
+  let store;
+  try {
+    await mkdir(path.dirname(sideChatStateFile), { recursive: true });
+    store = new NativeSessionStore(temporary, { watchChanges: false, sideChatStateFile });
+    const before = await stat(sideChatStateFile);
+    store.refresh();
+    store.refresh();
+    const after = await stat(sideChatStateFile);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.mtimeMs, before.mtimeMs);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('session listings keep lightweight status and detail LRU rebuilds complete history', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-detail-lru-'));
+  const sessionDir = path.join(temporary, 'sessions', '2026', '10', '26');
+  const ids = [
+    '019ff001-0000-7000-8000-000000000001',
+    '019ff001-0000-7000-8000-000000000002',
+  ];
+  let store;
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    for (const [index, id] of ids.entries()) {
+      await writeFile(path.join(sessionDir, `rollout-${id}.jsonl`), jsonl([
+        { timestamp: '2026-10-26T01:00:00.000Z', type: 'session_meta', payload: { id, cwd: temporary } },
+        { timestamp: '2026-10-26T01:00:01.000Z', type: 'turn_context', payload: { turn_id: `turn-${index}` } },
+        { timestamp: '2026-10-26T01:00:01.500Z', type: 'event_msg', payload: { type: 'task_started', turn_id: `turn-${index}` } },
+        { timestamp: '2026-10-26T01:00:02.000Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: `question-${index}` }] } },
+        { timestamp: '2026-10-26T01:00:03.000Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: `answer-${index}-${'x'.repeat(4096)}` }] } },
+        { timestamp: '2026-10-26T01:00:04.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: `turn-${index}` } },
+      ]));
+    }
+    store = new NativeSessionStore(temporary, {
+      watchChanges: false,
+      maxSessions: 10,
+      detailCacheMaxBytes: 6000,
+    });
+    assert.equal(store.list().length, 2);
+    assert.equal(store.details.size, 0, 'completed list rows retain only lightweight status');
+    assert.equal(store.listStatuses.size, 2);
+
+    const firstDetail = store.get(ids[0]);
+    assert.ok(firstDetail.messages.some((message) => /answer-0/.test(message.content || '')));
+    const firstMessage = firstDetail.messages[0];
+    assert.ok(store.get(ids[1]).messages.some((message) => /answer-1/.test(message.content || '')));
+    assert.equal(store.details.has(ids[0]), false, 'least-recent completed detail is evicted by byte capacity');
+    assert.equal(store.details.has(ids[1]), true);
+    assert.deepEqual(
+      store.getMessage(ids[0], firstMessage.seq, firstDetail.generation),
+      firstMessage,
+      'eviction alone preserves media/message generation identifiers',
+    );
+    store.get(ids[1]);
+    const paged = store.get(ids[0], {
+      after: 0,
+      generation: firstDetail.generation,
+      limit: 2,
+      historyPage: true,
+    });
+    assert.equal(paged.generation, firstDetail.generation);
+    assert.equal(paged.reset, false, 'eviction alone preserves pagination generation');
+    const rebuilt = store.get(ids[0]);
+    const rebuiltAnswer = rebuilt.messages.find((message) => /answer-0/.test(message.content || ''));
+    assert.match(rebuiltAnswer?.content, /answer-0/);
+    assert.match(rebuiltAnswer?.content, /x{100}/, 'eviction never truncates rebuilt history');
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('session listings invalidate a detail cache after a same-size in-place rewrite', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-same-size-'));
+  const sessionDir = path.join(temporary, 'sessions');
+  const id = '019ff001-0000-7000-8000-000000000003';
+  const sessionFile = path.join(sessionDir, `rollout-${id}.jsonl`);
+  let store;
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    const prefix = [
+      { timestamp: '2026-10-26T01:00:00.000Z', type: 'session_meta', payload: { id, cwd: temporary } },
+      { timestamp: '2026-10-26T01:00:01.000Z', type: 'turn_context', payload: { turn_id: 'turn-rewrite' } },
+    ];
+    const content = (kind, padding = '') => `${jsonl([
+      ...prefix,
+      { timestamp: '2026-10-26T01:00:02.000Z', type: 'event_msg', payload: { type: kind, turn_id: 'turn-rewrite' } },
+    ]).trimEnd()}${padding}\n`;
+    const completed = content('task_complete');
+    const running = content('task_started', ' ');
+    assert.equal(Buffer.byteLength(running), Buffer.byteLength(completed));
+    await writeFile(sessionFile, completed);
+    store = new NativeSessionStore(temporary, { watchChanges: false });
+    const beforeRewrite = store.get(id);
+    assert.equal(beforeRewrite?.status, 'done');
+    assert.equal(store.list()[0]?.status, 'done');
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await writeFile(sessionFile, running);
+    store.refresh();
+    assert.equal(store.list()[0]?.status, 'running');
+    assert.equal(store.details.get(id)?.mtimeMs, store.entries.get(id)?.mtimeMs);
+    assert.notEqual(store.get(id)?.generation, beforeRewrite.generation);
+    assert.equal(store.getMessage(id, beforeRewrite.messages[0].seq, beforeRewrite.generation), null);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('detail LRU may evict raw running state after the recovery window expires', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-stale-running-lru-'));
+  const sessionDir = path.join(temporary, 'sessions');
+  const staleId = '019ff001-0000-7000-8000-000000000004';
+  const doneId = '019ff001-0000-7000-8000-000000000005';
+  const staleFile = path.join(sessionDir, `rollout-${staleId}.jsonl`);
+  const doneFile = path.join(sessionDir, `rollout-${doneId}.jsonl`);
+  let store;
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(staleFile, jsonl([
+      { timestamp: '2026-10-26T01:00:00.000Z', type: 'session_meta', payload: { id: staleId, cwd: temporary } },
+      { timestamp: '2026-10-26T01:00:01.000Z', type: 'turn_context', payload: { turn_id: 'turn-stale' } },
+      { timestamp: '2026-10-26T01:00:02.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-stale' } },
+    ]));
+    await writeFile(doneFile, jsonl([
+      { timestamp: '2026-10-26T01:00:00.000Z', type: 'session_meta', payload: { id: doneId, cwd: temporary } },
+      { timestamp: '2026-10-26T01:00:01.000Z', type: 'turn_context', payload: { turn_id: 'turn-done' } },
+      { timestamp: '2026-10-26T01:00:02.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-done' } },
+    ]));
+    const old = new Date(Date.now() - 60_000);
+    await utimes(staleFile, old, old);
+    store = new NativeSessionStore(temporary, {
+      watchChanges: false,
+      runningWindowMs: 10,
+      detailCacheMaxBytes: 1,
+    });
+    assert.equal(store.get(staleId)?.status, 'interrupted');
+    assert.equal(store.details.get(staleId)?.status, 'running', 'raw cache retains the persisted task state');
+    store.get(doneId);
+    assert.equal(store.details.has(staleId), false, 'effective stale state no longer pins the cache forever');
+    assert.equal(store.details.has(doneId), true, 'the current detail request remains protected');
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('LRU eviction never assigns stale status or generation to a rewritten entry', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-stale-entry-lru-'));
+  const sessionDir = path.join(temporary, 'sessions');
+  const staleId = '019ff001-0000-7000-8000-000000000006';
+  const otherId = '019ff001-0000-7000-8000-000000000007';
+  const staleFile = path.join(sessionDir, `rollout-${staleId}.jsonl`);
+  const otherFile = path.join(sessionDir, `rollout-${otherId}.jsonl`);
+  let store;
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    const records = (id, turnId, kind, padding = '') => `${jsonl([
+      { timestamp: '2026-10-26T01:00:00.000Z', type: 'session_meta', payload: { id, cwd: temporary } },
+      { timestamp: '2026-10-26T01:00:01.000Z', type: 'turn_context', payload: { turn_id: turnId } },
+      { timestamp: '2026-10-26T01:00:02.000Z', type: 'event_msg', payload: { type: kind, turn_id: turnId } },
+    ]).trimEnd()}${padding}\n`;
+    const completed = records(staleId, 'turn-stale-entry', 'task_complete');
+    const rewritten = records(staleId, 'turn-stale-entry', 'task_started', ' ');
+    assert.equal(Buffer.byteLength(completed), Buffer.byteLength(rewritten));
+    await writeFile(staleFile, completed);
+    await writeFile(otherFile, records(otherId, 'turn-other-entry', 'task_complete'));
+    store = new NativeSessionStore(temporary, {
+      watchChanges: false,
+      maxSessions: 10,
+      detailCacheMaxBytes: 1,
+    });
+    const staleConversation = store.get(staleId);
+    const oldGeneration = staleConversation.generation;
+    const oldSequence = staleConversation.messages[0].seq;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await writeFile(staleFile, rewritten);
+    const rewrittenStat = await stat(staleFile);
+    const oldEntry = store.entries.get(staleId);
+    store.entries.set(staleId, {
+      ...oldEntry,
+      ino: rewrittenStat.ino,
+      size: rewrittenStat.size,
+      mtimeMs: rewrittenStat.mtimeMs,
+      updatedAt: rewrittenStat.mtime.toISOString(),
+    });
+
+    store.get(otherId);
+    assert.equal(store.details.has(staleId), false);
+    assert.equal(store.listStatuses.has(staleId), false, 'stale cache metadata is not rebound to the new entry');
+    const summary = store.list(1, { includeIds: [staleId] }).find((item) => item.id === staleId);
+    assert.equal(summary?.status, 'running');
+    const current = store.get(staleId);
+    assert.notEqual(current.generation, oldGeneration);
+    assert.equal(store.getMessage(staleId, oldSequence, oldGeneration), null);
   } finally {
     store?.stop();
     await rm(temporary, { recursive: true, force: true });

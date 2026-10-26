@@ -3009,6 +3009,47 @@ test('uses ordered Grok2API credential failover for authentication errors', asyn
   assert.doesNotMatch(JSON.stringify(listed), /bad-secret|good-secret|good-token/);
 });
 
+test('coalesces only concurrent Grok2API authentication for the same credential', async () => {
+  let loginCalls = 0;
+  let releaseLogin;
+  const loginGate = new Promise((resolve) => { releaseLogin = resolve; });
+  const source = { id: 'grok', provider: 'grok2api', baseUrl: 'https://grok.example', apiKey: 'admin:secret' };
+  const service = new SubQuotaService({
+    sources: [source],
+    now: () => 1_000_000,
+    fetchImpl: async (url) => {
+      assert.match(String(url), /\/auth\/login$/);
+      loginCalls += 1;
+      await loginGate;
+      return Response.json({ data: { tokens: { accessToken: 'shared-token' } } });
+    },
+  });
+  const credential = { id: 'primary' };
+  const normal = service.loginGrok2Api(source, credential, 'admin', 'secret');
+  const forced = service.loginGrok2Api(source, credential, 'admin', 'secret', { force: true });
+  releaseLogin();
+  assert.deepEqual(await Promise.all([normal, forced]), ['shared-token', 'shared-token']);
+  assert.equal(loginCalls, 1);
+});
+
+test('does not reuse a Grok2API login token after the configured password changes', async () => {
+  const passwords = [];
+  const source = { id: 'grok', provider: 'grok2api', baseUrl: 'https://grok.example' };
+  const service = new SubQuotaService({
+    sources: [source],
+    now: () => 1_000_000,
+    fetchImpl: async (_url, options) => {
+      const password = JSON.parse(options.body).password;
+      passwords.push(password);
+      return Response.json({ data: { tokens: { accessToken: `token-${password}` } } });
+    },
+  });
+  const credential = { id: 'primary' };
+  assert.equal(await service.loginGrok2Api(source, credential, 'admin', 'first'), 'token-first');
+  assert.equal(await service.loginGrok2Api(source, credential, 'admin', 'second'), 'token-second');
+  assert.deepEqual(passwords, ['first', 'second']);
+});
+
 test('isolates Grok2API cached tokens by credential id', async () => {
   const loginPasswords = [];
   const summaryTokens = [];

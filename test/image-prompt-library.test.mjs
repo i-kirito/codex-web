@@ -66,6 +66,81 @@ test('downloads a pinned GitHub revision and reloads it from runtime cache', asy
   }
 });
 
+test('coalesces identical asset downloads and evicts cached assets by total bytes', async () => {
+  const fixture = await createFixture();
+  let calls = 0;
+  let releaseFirst;
+  const first = new Promise((resolve) => { releaseFirst = resolve; });
+  const library = new ImagePromptLibrary({
+    ...fixture,
+    builtInRevision: BUILTIN_REVISION,
+    autoSync: false,
+    assetCacheMaxBytes: 5,
+    fetchImpl: async (url) => {
+      calls += 1;
+      if (calls === 1) await first;
+      const body = String(url).endsWith('/large.jpg')
+        ? [7, 8, 9, 10, 11, 12]
+        : String(url).endsWith('/one.jpg') ? [1, 2, 3] : [4, 5, 6];
+      return new Response(Uint8Array.from(body), { status: 200, headers: { 'Content-Type': 'image/jpeg' } });
+    },
+  });
+  try {
+    const left = library.fetchAsset('images/one.jpg');
+    const right = library.fetchAsset('images/one.jpg');
+    releaseFirst();
+    const [one, duplicate] = await Promise.all([left, right]);
+    assert.deepEqual([...one.body], [1, 2, 3]);
+    assert.strictEqual(one, duplicate);
+    assert.equal(calls, 1);
+    assert.strictEqual(await library.fetchAsset('images/one.jpg'), one);
+    assert.equal(calls, 1);
+    await library.fetchAsset('images/two.jpg');
+    assert.equal(calls, 2);
+    await library.fetchAsset('images/one.jpg');
+    assert.equal(calls, 3);
+    const large = await library.fetchAsset('images/large.jpg');
+    assert.deepEqual([...large.body], [7, 8, 9, 10, 11, 12]);
+    assert.equal(calls, 4);
+    await library.fetchAsset('images/large.jpg');
+    assert.equal(calls, 5, 'assets larger than the cache budget remain downloadable but are not retained');
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test('asset failures are retryable and cache entries remain isolated by revision and path', async () => {
+  const fixture = await createFixture();
+  const requested = [];
+  let failFirst = true;
+  const library = new ImagePromptLibrary({
+    ...fixture,
+    builtInRevision: BUILTIN_REVISION,
+    autoSync: false,
+    fetchImpl: async (url) => {
+      requested.push(String(url));
+      if (failFirst) {
+        failFirst = false;
+        throw new Error('temporary');
+      }
+      return new Response(Uint8Array.from([1]), { status: 200, headers: { 'Content-Type': 'image/png' } });
+    },
+  });
+  try {
+    await assert.rejects(library.fetchAsset('images/a.png'), /temporary/);
+    assert.equal((await library.fetchAsset('images/a.png')).revision, BUILTIN_REVISION);
+    await library.fetchAsset('images/b.png');
+    library.library = { ...library.library, revision: UPDATED_REVISION };
+    assert.equal((await library.fetchAsset('images/a.png')).revision, UPDATED_REVISION);
+    assert.equal(requested.length, 4);
+    assert.match(requested[1], new RegExp(`${BUILTIN_REVISION}/data/images/a\\.png$`));
+    assert.match(requested[2], new RegExp(`${BUILTIN_REVISION}/data/images/b\\.png$`));
+    assert.match(requested[3], new RegExp(`${UPDATED_REVISION}/data/images/a\\.png$`));
+  } finally {
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
 test('keeps the active library when a GitHub update is invalid', async () => {
   const fixture = await createFixture();
   const library = new ImagePromptLibrary({

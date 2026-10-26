@@ -38,6 +38,40 @@ test('prefers the Codex home IPC socket and retains the legacy candidate', () =>
   explicit.close();
 });
 
+test('decodes fragmented and coalesced Desktop IPC frames without growing a contiguous buffer', () => {
+  const client = new CodexDesktopIpcClient({ enabled: false });
+  const socket = { writable: true, destroy() {} };
+  const messages = [];
+  client.socket = socket;
+  client.handleMessage = (message) => messages.push(message);
+  const large = makeFrame({ type: 'broadcast', method: 'large', params: { text: 'x'.repeat(512 * 1024) } });
+  for (let offset = 0; offset < large.length; offset += 31) {
+    client.consumeData(socket, large.subarray(offset, Math.min(large.length, offset + 31)));
+  }
+  const combined = Buffer.concat([
+    makeFrame({ type: 'broadcast', method: 'one', params: {} }),
+    makeFrame({ type: 'broadcast', method: 'two', params: {} }),
+  ]);
+  client.consumeData(socket, combined);
+  assert.deepEqual(messages.map((message) => message.method), ['large', 'one', 'two']);
+  assert.equal(messages[0].params.text.length, 512 * 1024);
+  assert.equal(client.readBytes, 0);
+  assert.equal(client.readChunks.length, 0);
+  assert.equal(client.readFrameBytes, 0);
+  client.close();
+
+  const invalidClient = new CodexDesktopIpcClient({ enabled: false });
+  const invalidSocket = { writable: true, destroy() {} };
+  invalidClient.socket = invalidSocket;
+  const invalidHeader = Buffer.alloc(4);
+  invalidHeader.writeUInt32LE(0, 0);
+  invalidClient.consumeData(invalidSocket, invalidHeader);
+  assert.equal(invalidClient.socket, null);
+  assert.equal(invalidClient.readBytes, 0);
+  assert.equal(invalidClient.readChunks.length, 0);
+  invalidClient.close();
+});
+
 test('routes a turn through the Codex Desktop owner IPC client', async () => {
   const fixture = await createRouterFixture();
   let discoveryResponse;
@@ -694,9 +728,13 @@ function attachFrameReader(socket, onMessage) {
 }
 
 function sendFrame(socket, message) {
+  socket.write(makeFrame(message));
+}
+
+function makeFrame(message) {
   const payload = Buffer.from(JSON.stringify(message));
   const frame = Buffer.allocUnsafe(payload.length + 4);
   frame.writeUInt32LE(payload.length, 0);
   payload.copy(frame, 4);
-  socket.write(frame);
+  return frame;
 }

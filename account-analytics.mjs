@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 const ORIGIN = 'https://chatgpt.com';
@@ -50,8 +50,36 @@ export function normalizeAccountAnalytics(data, window, now = Date.now()) {
   };
 }
 
-export function createAccountAnalyticsReader(codexHome, { fetchImpl = fetch, now = Date.now } = {}) {
+export function createAccountAnalyticsReader(codexHome, {
+  fetchImpl = fetch,
+  now = Date.now,
+  readFileImpl = readFile,
+  statImpl = stat,
+} = {}) {
   let cache = null, pending = null;
+  let authSnapshot = null, authPending = null;
+  const authFile = path.join(codexHome, 'auth.json');
+  const authFileKey = (info) => `${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`;
+  async function readAuth() {
+    let info;
+    try { info = await statImpl(authFile); } catch { authSnapshot = null; return null; }
+    const key = authFileKey(info);
+    if (authSnapshot?.key === key) return authSnapshot.tokens;
+    if (authPending?.key === key) return authPending.promise;
+    const request = { key };
+    request.promise = (async () => {
+      let document;
+      try { document = JSON.parse(await readFileImpl(authFile, 'utf8')); } catch { return null; }
+      const tokens = document?.tokens || null;
+      let current;
+      try { current = await statImpl(authFile); } catch { return null; }
+      if (authFileKey(current) !== key) return readAuth();
+      authSnapshot = { key, tokens };
+      return tokens;
+    })().finally(() => { if (authPending === request) authPending = null; });
+    authPending = request;
+    return request.promise;
+  }
   async function get(url, auth) {
     const response = await fetchImpl(ORIGIN + url, {
       headers: { Authorization: 'Bearer ' + auth.access_token, 'ChatGPT-Account-Id': auth.account_id },
@@ -61,8 +89,7 @@ export function createAccountAnalyticsReader(codexHome, { fetchImpl = fetch, now
     return response.json();
   }
   return async function read({ refresh = false } = {}) {
-    let auth;
-    try { auth = JSON.parse(await readFile(path.join(codexHome, 'auth.json'), 'utf8'))?.tokens; } catch {}
+    const auth = await readAuth();
     if (!auth?.account_id || !auth?.access_token) return { available: false, loading: false };
     const key = auth.account_id + ':' + new Date(now()).toISOString().slice(0, 10);
     if (!refresh && cache?.key === key && cache.expiresAt > now()) return cache.value;
@@ -80,7 +107,7 @@ export function createAccountAnalyticsReader(codexHome, { fetchImpl = fetch, now
         const lookback = new Date(now() - 45 * 86400000).toISOString().slice(0, 10);
         const query = new URLSearchParams({ start_date: start < lookback ? start : lookback, end_date: end, group_by: 'day' });
         const daily = await get('/backend-api/wham/analytics/daily-workspace-usage-counts?' + query, auth);
-        const current = JSON.parse(await readFile(path.join(codexHome, 'auth.json'), 'utf8'))?.tokens;
+        const current = await readAuth();
         if (current?.account_id !== auth.account_id) throw new Error('账号已切换，请重新刷新');
         const value = normalizeAccountAnalytics(daily, window, now());
         cache = { key, value, expiresAt: now() + 60000 };

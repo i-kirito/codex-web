@@ -16,6 +16,7 @@ const REVISION_PATTERN = /^[0-9a-f]{40}$/i;
 const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_RETRY_MS = 5 * 60 * 1000;
+const DEFAULT_ASSET_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 
 export class ImagePromptLibrary {
   constructor({
@@ -31,6 +32,7 @@ export class ImagePromptLibrary {
     requestTimeoutMs = DEFAULT_TIMEOUT_MS,
     now = () => new Date(),
     logger = console,
+    assetCacheMaxBytes = DEFAULT_ASSET_CACHE_MAX_BYTES,
   }) {
     if (!cacheDir || !casesFile || !stylesFile) throw new Error('提示词库路径配置不完整');
     if (typeof fetchImpl !== 'function') throw new Error('当前运行环境不支持 fetch');
@@ -50,6 +52,10 @@ export class ImagePromptLibrary {
     this.requestTimeoutMs = finitePositiveNumber(requestTimeoutMs, DEFAULT_TIMEOUT_MS);
     this.now = now;
     this.logger = logger;
+    this.assetCacheMaxBytes = Math.max(0, Number(assetCacheMaxBytes) || 0);
+    this.assetCacheBytes = 0;
+    this.assetCache = new Map();
+    this.assetPending = new Map();
     this.timer = null;
     this.retryTimer = null;
     this.syncPromise = null;
@@ -125,6 +131,25 @@ export class ImagePromptLibrary {
   async fetchAsset(relativePath, { fetchImpl = this.fetchImpl } = {}) {
     if (typeof fetchImpl !== 'function') throw new Error('当前运行环境不支持 fetch');
     const asset = this.resolveAsset(relativePath);
+    const cacheKey = `${asset.revision}:${asset.path}`;
+    const cached = this.assetCache.get(cacheKey);
+    if (cached) {
+      this.assetCache.delete(cacheKey);
+      this.assetCache.set(cacheKey, cached);
+      return cached;
+    }
+    if (this.assetPending.has(cacheKey)) return this.assetPending.get(cacheKey);
+    const pending = this.downloadAsset(asset, fetchImpl).then((downloaded) => {
+      this.cacheAsset(cacheKey, downloaded);
+      return downloaded;
+    }).finally(() => {
+      if (this.assetPending.get(cacheKey) === pending) this.assetPending.delete(cacheKey);
+    });
+    this.assetPending.set(cacheKey, pending);
+    return pending;
+  }
+
+  async downloadAsset(asset, fetchImpl) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
     timeout.unref?.();
@@ -165,6 +190,22 @@ export class ImagePromptLibrary {
       throw failed;
     } finally {
       clearTimeout(timeout);
+    }
+  }
+
+  cacheAsset(key, asset) {
+    const bytes = asset?.body?.byteLength || 0;
+    if (!bytes || bytes > this.assetCacheMaxBytes) return;
+    const existing = this.assetCache.get(key);
+    if (existing) this.assetCacheBytes -= existing.body?.byteLength || 0;
+    this.assetCache.delete(key);
+    this.assetCache.set(key, asset);
+    this.assetCacheBytes += bytes;
+    while (this.assetCacheBytes > this.assetCacheMaxBytes && this.assetCache.size) {
+      const oldestKey = this.assetCache.keys().next().value;
+      const oldest = this.assetCache.get(oldestKey);
+      this.assetCache.delete(oldestKey);
+      this.assetCacheBytes -= oldest?.body?.byteLength || 0;
     }
   }
 

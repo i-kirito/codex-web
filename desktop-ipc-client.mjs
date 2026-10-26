@@ -95,7 +95,11 @@ export class CodexDesktopIpcClient extends EventEmitter {
     this.socket = null;
     this.startPromise = null;
     this.clientId = INITIAL_CLIENT_ID;
-    this.readBuffer = Buffer.alloc(0);
+    this.readChunks = [];
+    this.readChunkIndex = 0;
+    this.readChunkOffset = 0;
+    this.readBytes = 0;
+    this.readFrameBytes = 0;
     this.pending = new Map();
     this.closing = false;
     this.reconnectDelaysMs = normalizeReconnectDelays(options.reconnectDelaysMs);
@@ -306,7 +310,7 @@ export class CodexDesktopIpcClient extends EventEmitter {
     const socket = this.socket;
     this.socket = null;
     this.clientId = INITIAL_CLIENT_ID;
-    this.readBuffer = Buffer.alloc(0);
+    this.resetReadState();
     this.startPromise = null;
     this.rejectPending(new Error('Codex Desktop IPC 已关闭'));
     socket?.destroy();
@@ -331,7 +335,7 @@ export class CodexDesktopIpcClient extends EventEmitter {
     this.socketPath = socketPath;
     const socket = net.createConnection(this.socketPath);
     this.socket = socket;
-    this.readBuffer = Buffer.alloc(0);
+    this.resetReadState();
     socket.on('data', (chunk) => this.consumeData(socket, chunk));
     socket.on('close', () => this.handleSocketFailure(socket, new Error('Codex Desktop IPC 连接已关闭')));
     socket.on('error', (error) => this.handleSocketFailure(socket, error));
@@ -430,17 +434,23 @@ export class CodexDesktopIpcClient extends EventEmitter {
 
   consumeData(socket, chunk) {
     if (this.socket !== socket || !chunk.length) return;
-    this.readBuffer = Buffer.concat([this.readBuffer, chunk]);
+    this.readChunks.push(chunk);
+    this.readBytes += chunk.length;
 
-    while (this.readBuffer.length >= 4) {
-      const frameBytes = this.readBuffer.readUInt32LE(0);
-      if (frameBytes === 0 || frameBytes > MAX_FRAME_BYTES) {
-        this.handleSocketFailure(socket, new Error(`Codex Desktop IPC 帧长度无效: ${frameBytes}`));
-        return;
+    while (true) {
+      if (!this.readFrameBytes) {
+        if (this.readBytes < 4) return;
+        const header = this.takeReadBytes(4);
+        const frameBytes = header.readUInt32LE(0);
+        if (frameBytes === 0 || frameBytes > MAX_FRAME_BYTES) {
+          this.handleSocketFailure(socket, new Error(`Codex Desktop IPC 帧长度无效: ${frameBytes}`));
+          return;
+        }
+        this.readFrameBytes = frameBytes;
       }
-      if (this.readBuffer.length < frameBytes + 4) return;
-      const payload = this.readBuffer.subarray(4, frameBytes + 4);
-      this.readBuffer = this.readBuffer.subarray(frameBytes + 4);
+      if (this.readBytes < this.readFrameBytes) return;
+      const payload = this.takeReadBytes(this.readFrameBytes);
+      this.readFrameBytes = 0;
       try {
         this.handleMessage(JSON.parse(payload.toString('utf8')));
       } catch (error) {
@@ -448,6 +458,63 @@ export class CodexDesktopIpcClient extends EventEmitter {
         return;
       }
     }
+  }
+
+  takeReadBytes(length) {
+    if (length > this.readBytes) throw new RangeError('Codex Desktop IPC 读取缓冲不足');
+    const first = this.readChunks[this.readChunkIndex];
+    const firstAvailable = first ? first.length - this.readChunkOffset : 0;
+    if (firstAvailable === length) {
+      const output = first.subarray(this.readChunkOffset);
+      this.readChunkIndex += 1;
+      this.readChunkOffset = 0;
+      this.readBytes -= length;
+      this.compactReadChunks();
+      return output;
+    }
+    if (firstAvailable > length) {
+      const output = first.subarray(this.readChunkOffset, this.readChunkOffset + length);
+      this.readChunkOffset += length;
+      this.readBytes -= length;
+      return output;
+    }
+    const output = Buffer.allocUnsafe(length);
+    let offset = 0;
+    while (offset < length) {
+      const head = this.readChunks[this.readChunkIndex];
+      const available = head.length - this.readChunkOffset;
+      const take = Math.min(available, length - offset);
+      head.copy(output, offset, this.readChunkOffset, this.readChunkOffset + take);
+      offset += take;
+      this.readChunkOffset += take;
+      if (this.readChunkOffset === head.length) {
+        this.readChunkIndex += 1;
+        this.readChunkOffset = 0;
+      }
+    }
+    this.readBytes -= length;
+    this.compactReadChunks();
+    return output;
+  }
+
+  compactReadChunks() {
+    if (this.readBytes === 0) {
+      this.readChunks = [];
+      this.readChunkIndex = 0;
+      this.readChunkOffset = 0;
+      return;
+    }
+    if (this.readChunkIndex < 1024 || this.readChunkIndex * 2 < this.readChunks.length) return;
+    this.readChunks = this.readChunks.slice(this.readChunkIndex);
+    this.readChunkIndex = 0;
+  }
+
+  resetReadState() {
+    this.readChunks = [];
+    this.readChunkIndex = 0;
+    this.readChunkOffset = 0;
+    this.readBytes = 0;
+    this.readFrameBytes = 0;
   }
 
   handleMessage(message) {
@@ -505,7 +572,7 @@ export class CodexDesktopIpcClient extends EventEmitter {
     if (this.socket !== socket) return;
     this.socket = null;
     this.clientId = INITIAL_CLIENT_ID;
-    this.readBuffer = Buffer.alloc(0);
+    this.resetReadState();
     this.rejectPending(error);
     if (!this.closing) {
       this.emit('disconnect', error);

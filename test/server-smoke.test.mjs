@@ -4183,13 +4183,15 @@ test('playground refresh preserves browser streaming preferences and completed A
   assert.match(playgroundIntegration, /actions\.prepend\(createButton\('desktop'\)\)/);
   assert.match(playgroundIntegration, /actions\.prepend\(createButton\('mobile'\)\)/);
   assert.doesNotMatch(playgroundIntegration, /const brandRow=/);
-  assert.match(playgroundIntegration, /setInterval\(scheduleEnsureButtons, 1500\)/);
+  assert.doesNotMatch(playgroundIntegration, /setInterval\(scheduleEnsureButtons/);
+  assert.match(playgroundIntegration, /new MutationObserver/);
+  assert.match(playgroundIntegration, /if \(toolbarMutationRelevant\(records\)\) scheduleEnsureButtons\(\)/);
+  assert.match(playgroundIntegration, /if \(!document\.hidden\) scheduleEnsureButtons\(\)/);
   assert.match(playgroundIntegration, /if \(reloadWhenIdleTimer\) return/);
   assert.match(playgroundIntegration, /setTimeout\(reloadWhenGenerationEnds, 900\)/);
   assert.match(playgroundIntegration, /if \(document\.querySelector\('button\[aria-label=/);
   assert.match(playgroundIntegration, /scheduleReloadWhenIdle\(\);\s*\n\s*return/);
   assert.match(playgroundIntegration, /window\.location\.reload\(\)/);
-  assert.doesNotMatch(playgroundIntegration, /MutationObserver/);
   const playgroundAssetScript = await readFile(
     path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', playgroundAssetPath),
     'utf8',
@@ -6091,6 +6093,29 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     assert.match(homepageHtml, /<title>Codex Web Test<\/title>/);
     assert.doesNotMatch(homepageHtml, /class="pill"/);
     assert.doesNotMatch(homepageHtml, />Protected</);
+    assert.equal(homepage.headers.get('cache-control'), 'no-store');
+    const versionedAssets = [...homepageHtml.matchAll(/(?:src|href)="(\/assets\/[a-f0-9]{64}\/[^"?]+)"/g)].map((match) => match[1]);
+    assert.equal(versionedAssets.length, 5);
+    assert.doesNotMatch(homepageHtml, /function findDuplicateAssistantBubble\(/);
+    for (const route of versionedAssets) {
+      const resource = await fetch(baseUrl + route);
+      assert.equal(resource.status, 200, route);
+      assert.match(resource.headers.get('cache-control'), /max-age=31536000, immutable/);
+      assert.equal(resource.headers.get('x-content-type-options'), 'nosniff');
+      const body = await resource.text();
+      if (route.endsWith('/app.js')) {
+        assert.match(body, /function findDuplicateAssistantBubble\(/);
+        new Function(body);
+      } else {
+        assert.equal(body, await readFile(path.join(ROOT, path.basename(route)), 'utf8'));
+      }
+      assert.ok(resource.headers.get('etag'));
+      const conditional = await fetch(baseUrl + route, { headers: { 'If-None-Match': resource.headers.get('etag'), 'Cache-Control': 'max-age=0' } });
+      assert.equal(conditional.status, 304);
+    }
+    const dreamSkill = await fetch(baseUrl + '/assets/dream-skin/SKILL.md', { headers: { Cookie: cookie } });
+    assert.equal(dreamSkill.status, 200, 'versioned assets must not shadow Dream Skin resources');
+    assert.equal((await fetch(baseUrl + '/assets/' + '0'.repeat(64) + '/app.js')).status, 404);
     const grok2ApiConsole = await fetch(`${baseUrl}/api/sub-quotas/grok2api/console?tail=999`, {
       headers: { Cookie: cookie },
     });
@@ -6861,13 +6886,21 @@ updated_at = 1784422800000
 
     const pageResponse = await fetch(baseUrl, { headers: { Cookie: cookie } });
     assert.equal(pageResponse.status, 200);
-    const page = await pageResponse.text();
+    const pageMarkup = await pageResponse.text();
+    const mainScriptTag = pageMarkup.match(/<script src="(\/assets\/[a-f0-9]{64}\/app\.js)"><\/script>/);
+    assert.ok(mainScriptTag);
+    const mainScriptResponse = await fetch(baseUrl + mainScriptTag[1]);
+    assert.equal(mainScriptResponse.status, 200);
+    const mainScriptSource = await mainScriptResponse.text();
+    // Inspect the delivered script alongside markup, independent of whether
+    // the browser obtained that script from the network or its immutable cache.
+    const page = pageMarkup.replace(mainScriptTag[0], () => `<script>${mainScriptSource}</script>`);
     assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
-    assert.match(page, /href="\/ui\.css\?v=subquota-key-order-20260830a"/);
-    assert.match(page, /href="\/image-prompt\.css\?v=top-context-padding-20260801b"/);
-    assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260803a"/);
+    assert.match(page, /href="\/assets\/[a-f0-9]{64}\/ui\.css"/);
+    assert.match(page, /href="\/assets\/[a-f0-9]{64}\/image-prompt\.css"/);
+    assert.match(page, /src="\/assets\/[a-f0-9]{64}\/image-prompt\.js"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
     assert.doesNotMatch(page, /\['plain','纯净'\]|\['paper','纸张'\]|\['grid','网格'\]/);
     assert.match(page, /function createDreamSkinGenerator/);

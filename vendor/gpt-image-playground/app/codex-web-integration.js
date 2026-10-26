@@ -15,6 +15,7 @@
   let pollTimer = 0;
   let toastTimer = 0;
   let ensureFrame = 0;
+  let toolbarObserver = null;
   let reloadWhenIdleTimer = 0;
   let updateStartVersion = '';
 
@@ -51,6 +52,26 @@
   function scheduleEnsureButtons() {
     if (ensureFrame) return;
     ensureFrame = requestAnimationFrame(ensureButtons);
+  }
+
+  function toolbarMutationRelevant(records) {
+    for (const record of records) {
+      if (record.target?.closest?.('header')) return true;
+      for (const node of [...record.addedNodes, ...record.removedNodes]) {
+        if (node?.nodeType !== Node.ELEMENT_NODE) continue;
+        if (node.matches?.('header') || node.querySelector?.('header')) return true;
+      }
+    }
+    return false;
+  }
+
+  function observeToolbar() {
+    if (toolbarObserver || !document.body) return;
+    toolbarObserver = new MutationObserver((records) => {
+      if (document.hidden) return;
+      if (toolbarMutationRelevant(records)) scheduleEnsureButtons();
+    });
+    toolbarObserver.observe(document.body, { childList: true, subtree: true });
   }
 
   function applyStatus(next) {
@@ -198,7 +219,10 @@
 
   function init() {
     ensureButtons();
-    window.setInterval(scheduleEnsureButtons, 1500);
+    observeToolbar();
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) scheduleEnsureButtons();
+    });
     void readStatus();
   }
 

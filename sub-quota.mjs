@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 const DEFAULT_TIMEOUT_MS = 10000;
 const DEFAULT_CACHE_TTL_MS = 30000;
 const ERROR_CACHE_TTL_MS = 5000;
@@ -52,6 +54,7 @@ export class SubQuotaService {
     this.lastSuccessfulBySource = new Map();
     this.lastSuccessfulNewApiByCredential = new Map();
     this.activeCredentialBySource = new Map();
+    this.grok2ApiLoginPending = new Map();
   }
 
   static fromEnvironment(env = process.env, options = {}) {
@@ -447,40 +450,47 @@ export class SubQuotaService {
 
   async loginGrok2Api(source, credential, username, password, { force = false } = {}) {
     if (!this.grok2ApiTokens) this.grok2ApiTokens = new Map();
-    const cacheKey = `${credentialPoolKey(source)}::${credential.id}::${username}`;
+    const secretIdentity = createHash('sha256').update(String(password)).digest('hex');
+    const cacheKey = `${credentialPoolKey(source)}::${credential.id}::${username}::${secretIdentity}`;
     const cached = this.grok2ApiTokens.get(cacheKey);
     const now = this.now();
     if (!force && cached?.token && cached.expiresAt > now + 5000) return cached.token;
-
-    const data = await this.requestJson(`${source.baseUrl}/api/admin/v1/auth/login`, {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ username, password }),
+    if (this.grok2ApiLoginPending.has(cacheKey)) return this.grok2ApiLoginPending.get(cacheKey);
+    const pending = (async () => {
+      const data = await this.requestJson(`${source.baseUrl}/api/admin/v1/auth/login`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ username, password }),
+      });
+      const payload = unwrapGrok2ApiData(data);
+      const token = cleanText(
+        payload?.tokens?.accessToken
+        || payload?.accessToken
+        || data?.tokens?.accessToken
+        || data?.accessToken,
+        4096,
+      );
+      if (!token) throw new Error('Grok2API 登录未返回 accessToken');
+      const expiresAtText = cleanDate(
+        payload?.tokens?.accessTokenExpiresAt
+        || payload?.accessTokenExpiresAt
+        || data?.tokens?.accessTokenExpiresAt
+        || data?.accessTokenExpiresAt,
+      );
+      const expiresAt = expiresAtText ? Date.parse(expiresAtText) : now + 10 * 60 * 1000;
+      this.grok2ApiTokens.set(cacheKey, {
+        token,
+        expiresAt: Number.isFinite(expiresAt) ? expiresAt : now + 10 * 60 * 1000,
+      });
+      return token;
+    })().finally(() => {
+      if (this.grok2ApiLoginPending.get(cacheKey) === pending) this.grok2ApiLoginPending.delete(cacheKey);
     });
-    const payload = unwrapGrok2ApiData(data);
-    const token = cleanText(
-      payload?.tokens?.accessToken
-      || payload?.accessToken
-      || data?.tokens?.accessToken
-      || data?.accessToken,
-      4096,
-    );
-    if (!token) throw new Error('Grok2API 登录未返回 accessToken');
-    const expiresAtText = cleanDate(
-      payload?.tokens?.accessTokenExpiresAt
-      || payload?.accessTokenExpiresAt
-      || data?.tokens?.accessTokenExpiresAt
-      || data?.accessTokenExpiresAt,
-    );
-    const expiresAt = expiresAtText ? Date.parse(expiresAtText) : now + 10 * 60 * 1000;
-    this.grok2ApiTokens.set(cacheKey, {
-      token,
-      expiresAt: Number.isFinite(expiresAt) ? expiresAt : now + 10 * 60 * 1000,
-    });
-    return token;
+    this.grok2ApiLoginPending.set(cacheKey, pending);
+    return pending;
   }
 
   async withSourceCredentialFailover(source, request) {

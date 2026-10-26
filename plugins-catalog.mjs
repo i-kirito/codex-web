@@ -1,10 +1,28 @@
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'fs';
+import { readdir, readFile } from 'node:fs/promises';
 import { homedir } from 'os';
 import path from 'path';
 
 const MAX_DESCRIPTION = 160;
 const DEFAULT_CACHE_TTL_MS = 5_000;
-let pluginCache = null;
+const pluginCache = new Map();
+
+function cacheKey(codexHome, home) {
+  return `${path.resolve(codexHome || path.join(home, '.codex'))}\0${path.resolve(home)}`;
+}
+
+function createIoLimiter(limit = 8) {
+  let active = 0;
+  const queue = [];
+  const drain = () => {
+    while (active < limit && queue.length) {
+      const { operation, resolve, reject } = queue.shift();
+      active += 1;
+      Promise.resolve().then(operation).then(resolve, reject).finally(() => { active -= 1; drain(); });
+    }
+  };
+  return (operation) => new Promise((resolve, reject) => { queue.push({ operation, resolve, reject }); drain(); });
+}
 
 function safeRealpath(target) {
   try { return realpathSync(target); } catch { return path.resolve(target); }
@@ -122,17 +140,95 @@ export function listCodexPlugins(codexHome, {
   force = false,
 } = {}) {
   const now = Date.now();
-  if (!force && pluginCache && pluginCache.expiresAt > now) return pluginCache.plugins;
+  const key = cacheKey(codexHome, home);
+  const cached = pluginCache.get(key);
+  if (!force && cached?.expiresAt > now) return cached.plugins;
   const plugins = listCodexPluginsUncached(codexHome, home);
-  pluginCache = {
+  pluginCache.set(key, {
     expiresAt: now + Math.max(0, Number(cacheTtlMs) || 0),
     plugins,
-  };
+  });
   return plugins;
 }
 
+async function collectPluginsFromCacheAsync(cacheRoot, io) {
+  let markets;
+  try { markets = await io(() => readdir(cacheRoot, { withFileTypes: true })); } catch { return []; }
+  const marketResults = await Promise.all(markets.map(async (market) => {
+    if (!market.isDirectory() || market.name.startsWith('.')) return [];
+    let plugins;
+    try { plugins = await io(() => readdir(path.join(cacheRoot, market.name), { withFileTypes: true })); } catch { return []; }
+    return Promise.all(plugins.map(async (plugin) => {
+      if (!plugin.isDirectory() || plugin.name.startsWith('.')) return null;
+      const pluginDir = path.join(cacheRoot, market.name, plugin.name);
+      let versions;
+      try { versions = await io(() => readdir(pluginDir, { withFileTypes: true })); } catch { return null; }
+      const version = versions.filter((entry) => entry.isDirectory() && !entry.name.startsWith('.')).map((entry) => entry.name).sort().at(-1);
+      if (!version) return null;
+      let manifest;
+      try { manifest = await io(() => readFile(path.join(pluginDir, version, '.codex-plugin', 'plugin.json'), 'utf8')); } catch (error) {
+        // Missing manifests are ignored, while existing but unreadable files
+        // match readPluginJson() by falling back to the directory name.
+        if (error?.code === 'ENOENT') return null;
+        manifest = '';
+      }
+      let data;
+      try { data = JSON.parse(manifest); } catch { data = {}; }
+      const name = sanitizePluginName(data.name || plugin.name);
+      if (!name) return null;
+      return { id: name, name, title: titleCasePlugin(data.name || name), description: scrubText(data.description || ''), market: market.name, invocation: '@' + name };
+    }));
+  }));
+  return marketResults.flat(2).filter(Boolean);
+}
+
+export async function listCodexPluginsUncachedAsync(codexHome, home = homedir(), { concurrency = 8 } = {}) {
+  const io = createIoLimiter(Math.max(1, Number(concurrency) || 8));
+  const seen = new Set();
+  const plugins = [];
+  const homeDir = home || homedir();
+  const codex = codexHome || path.join(homeDir, '.codex');
+  const roots = [...new Set([
+    path.resolve(path.join(codex, 'plugins', 'cache')),
+    path.resolve(path.join(homeDir, '.codex', 'plugins', 'cache')),
+  ])];
+  for (const root of roots) {
+    for (const plugin of await collectPluginsFromCacheAsync(root, io)) {
+      const key = plugin.name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      plugins.push(plugin);
+    }
+  }
+  plugins.sort((a, b) => a.title.localeCompare(b.title, 'en', { sensitivity: 'base' }));
+  return plugins;
+}
+
+export async function listCodexPluginsAsync(codexHome, {
+  home = homedir(), cacheTtlMs = DEFAULT_CACHE_TTL_MS, force = false, concurrency = 8,
+} = {}) {
+  const now = Date.now();
+  const key = cacheKey(codexHome, home);
+  const cached = pluginCache.get(key);
+  if (!force && cached?.expiresAt > now) return cached.plugins;
+  if (cached?.pending) return cached.pending;
+  const request = { pending: null };
+  const pending = listCodexPluginsUncachedAsync(codexHome, home, { concurrency }).then((plugins) => {
+    if (pluginCache.get(key) === request) {
+      pluginCache.set(key, { expiresAt: Date.now() + Math.max(0, Number(cacheTtlMs) || 0), plugins });
+    }
+    return plugins;
+  }).catch((error) => {
+    if (pluginCache.get(key) === request) pluginCache.delete(key);
+    throw error;
+  });
+  request.pending = pending;
+  pluginCache.set(key, request);
+  return pending;
+}
+
 export function clearCodexPluginsCache() {
-  pluginCache = null;
+  pluginCache.clear();
 }
 
 export { sanitizePluginName, titleCasePlugin, scrubText as scrubPluginText };

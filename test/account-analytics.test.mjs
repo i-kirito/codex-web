@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rename, writeFile, rm, stat, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createAccountAnalyticsReader, normalizeAccountAnalytics } from '../account-analytics.mjs';
@@ -8,6 +8,19 @@ import { createAccountAnalyticsReader, normalizeAccountAnalytics } from '../acco
 const now=Date.parse('2026-09-08T13:00:00Z');
 const window={reset_at:Date.parse('2026-09-15T01:00:00Z')/1000,limit_window_seconds:604800,used_percent:30};
 const payload={balance_unit:'credit',group_by:'day',data:[{date:'2026-09-08',totals:{credits:15026.213426,cached_text_input_tokens:228130432,uncached_text_input_tokens:8621784,text_output_tokens:483154,text_total_tokens:237235370,turns:0}}]};
+
+function analyticsFetch(authorizations) {
+  return async (url, options) => {
+    authorizations.push(options.headers.Authorization);
+    const id = options.headers['ChatGPT-Account-Id'];
+    if (url.endsWith('/usage')) return Response.json({ account_id: id, rate_limit: { primary_window: window } });
+    return Response.json(payload);
+  };
+}
+
+function authPayload(accountId, accessToken) {
+  return JSON.stringify({ tokens: { account_id: accountId, access_token: accessToken } });
+}
 
 test('native official totals match Meter conventions and do not confuse spent value with projected value',()=>{
   const value=normalizeAccountAnalytics(payload,window,now);
@@ -55,4 +68,81 @@ test('official reader uses only server credentials, caches per account and refus
     const denied=createAccountAnalyticsReader(home,{now:()=>now,fetchImpl:async()=>new Response('dummy-secret-A',{status:401})});
     const failure=await denied();assert.equal(failure.available,false);assert.match(failure.error,/401/);assert.doesNotMatch(failure.error,/dummy-secret/);
   }finally{await rm(home,{recursive:true,force:true});}
+});
+
+test('auth metadata cache reloads same-inode same-size credential updates', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'account-analytics-metadata-'));
+  const authFile = path.join(home, 'auth.json');
+  const authorizations = [];
+  try {
+    await writeFile(authFile, authPayload('A', 'token-111'));
+    const before = await stat(authFile);
+    const read = createAccountAnalyticsReader(home, { now: () => now, fetchImpl: analyticsFetch(authorizations) });
+    assert.equal((await read({ refresh: true })).available, true);
+    await writeFile(authFile, authPayload('A', 'token-222'));
+    await utimes(authFile, new Date(), new Date(Date.now() + 2000));
+    const after = await stat(authFile);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.size, before.size);
+    assert.equal((await read({ refresh: true })).available, true);
+    assert.deepEqual(authorizations, [
+      'Bearer token-111', 'Bearer token-111',
+      'Bearer token-222', 'Bearer token-222',
+    ]);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test('auth metadata cache follows atomic auth-file replacement', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'account-analytics-replace-'));
+  const authFile = path.join(home, 'auth.json');
+  const replacement = path.join(home, 'auth.next.json');
+  const authorizations = [];
+  try {
+    await writeFile(authFile, authPayload('A', 'token-old'));
+    const before = await stat(authFile);
+    const read = createAccountAnalyticsReader(home, { now: () => now, fetchImpl: analyticsFetch(authorizations) });
+    await read({ refresh: true });
+    await writeFile(replacement, authPayload('A', 'token-new'));
+    await rename(replacement, authFile);
+    assert.notEqual((await stat(authFile)).ino, before.ino);
+    await read({ refresh: true });
+    assert.deepEqual(authorizations.slice(-2), ['Bearer token-new', 'Bearer token-new']);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test('auth read failure is not cached after the file becomes available', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'account-analytics-recovery-'));
+  const authorizations = [];
+  try {
+    const read = createAccountAnalyticsReader(home, { now: () => now, fetchImpl: analyticsFetch(authorizations) });
+    assert.deepEqual(await read(), { available: false, loading: false });
+    await writeFile(path.join(home, 'auth.json'), authPayload('A', 'token-ok'));
+    assert.equal((await read()).available, true);
+    assert.deepEqual(authorizations, ['Bearer token-ok', 'Bearer token-ok']);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test('transient auth read and parse failures are retryable with unchanged metadata', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'account-analytics-transient-read-'));
+  const authFile = path.join(home, 'auth.json');
+  const authorizations = [];
+  let attempts = 0;
+  try {
+    await writeFile(authFile, authPayload('A', 'token-ok'));
+    const read = createAccountAnalyticsReader(home, {
+      now: () => now,
+      fetchImpl: analyticsFetch(authorizations),
+      readFileImpl: async (...args) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('temporary read failure');
+        if (attempts === 2) return '{invalid';
+        return readFile(...args);
+      },
+    });
+    assert.deepEqual(await read(), { available: false, loading: false });
+    assert.deepEqual(await read(), { available: false, loading: false });
+    assert.equal((await read()).available, true);
+    assert.equal(attempts, 3);
+    assert.deepEqual(authorizations, ['Bearer token-ok', 'Bearer token-ok']);
+  } finally { await rm(home, { recursive: true, force: true }); }
 });

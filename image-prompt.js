@@ -60,6 +60,11 @@
     playgroundSlowTimer: 0,
     playgroundReadyPoll: 0,
   };
+  const searchTextCache = new WeakMap();
+  const promptCardCache = new Map();
+  let renderedPromptKeys = [];
+  let renderedPromptNodes = [];
+  let searchRenderFrame = 0;
 
   const elements = {};
 
@@ -314,7 +319,11 @@
     elements.search.addEventListener('input', () => {
       state.query = elements.search.value.trim();
       state.visible = PAGE_SIZE;
-      renderLibrary();
+      if (searchRenderFrame) cancelAnimationFrame(searchRenderFrame);
+      searchRenderFrame = requestAnimationFrame(() => {
+        searchRenderFrame = 0;
+        renderLibrary();
+      });
     });
     elements.category.addEventListener('change', () => {
       state.category = elements.category.value;
@@ -496,6 +505,7 @@
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '提示词库载入失败');
       state.library = data;
+      prunePromptCardCache(data);
       populateLibraryChrome();
       renderLibrary();
       return Boolean(previousVersion && previousVersion !== data.version);
@@ -669,18 +679,53 @@
       if (state.category && item.category !== state.category) return false;
       if (state.favoritesOnly && !state.favorites.has(itemKey(type, item))) return false;
       if (!query) return true;
-      const searchable = [
-        itemTitle(item),
-        itemDescription(item),
-        item.prompt,
-        item.promptPreview,
-        item.category,
-        ...(item.styles || []),
-        ...(item.scenes || []),
-        ...(item.tags || []),
-      ].filter(Boolean).join(' ').toLocaleLowerCase();
+      let searchable = searchTextCache.get(item);
+      if (searchable === undefined) {
+        searchable = [
+          itemTitle(item),
+          itemDescription(item),
+          item.prompt,
+          item.promptPreview,
+          item.category,
+          ...(item.styles || []),
+          ...(item.scenes || []),
+          ...(item.tags || []),
+        ].filter(Boolean).join(' ').toLocaleLowerCase();
+        searchTextCache.set(item, searchable);
+      }
       return searchable.includes(query);
     });
+  }
+
+  function promptCardSignature(type, item) {
+    return JSON.stringify([
+      type, itemTitle(item), itemDescription(item), item.prompt, item.promptPreview,
+      item.category, item.image, item.cover, item.imageAlt,
+      item.styles || [], item.tags || [],
+    ]);
+  }
+
+  function prunePromptCardCache(library) {
+    const valid = new Set([
+      ...(library?.cases || []).map((item) => itemKey('case', item)),
+      ...(library?.templates || []).map((item) => itemKey('template', item)),
+    ]);
+    for (const key of promptCardCache.keys()) {
+      if (!valid.has(key)) promptCardCache.delete(key);
+    }
+  }
+
+  function reusablePromptCard(type, item) {
+    const key = itemKey(type, item);
+    const signature = promptCardSignature(type, item);
+    let cached = promptCardCache.get(key);
+    if (!cached || cached.item !== item || cached.signature !== signature) {
+      cached = { item, signature, node: createPromptCard(item) };
+      promptCardCache.set(key, cached);
+    }
+    const favorite = cached.node._favoriteButton;
+    favorite?.classList.toggle('active', state.favorites.has(key));
+    return cached.node;
   }
 
   function renderLibrary() {
@@ -688,10 +733,28 @@
     elements.loading.classList.add('hidden');
     const items = filteredItems();
     const visible = items.slice(0, state.visible);
-    elements.grid.replaceChildren();
-    const fragment = document.createDocumentFragment();
-    for (const item of visible) fragment.appendChild(createPromptCard(item));
-    elements.grid.appendChild(fragment);
+    const type = state.mode === 'templates' ? 'template' : 'case';
+    const nextKeys = visible.map((item) => itemKey(type, item));
+    const nextNodes = visible.map((item) => reusablePromptCard(type, item));
+    const appendOnly = renderedPromptKeys.length < nextKeys.length
+      && renderedPromptKeys.every((key, index) => key === nextKeys[index])
+      && renderedPromptNodes.every((node, index) => node === nextNodes[index])
+      && elements.grid.children.length === renderedPromptKeys.length;
+    if (appendOnly) {
+      const fragment = document.createDocumentFragment();
+      for (let index = renderedPromptKeys.length; index < nextNodes.length; index += 1) {
+        fragment.appendChild(nextNodes[index]);
+      }
+      elements.grid.appendChild(fragment);
+    } else if (nextKeys.length !== renderedPromptKeys.length
+      || nextKeys.some((key, index) => key !== renderedPromptKeys[index])
+      || nextNodes.some((node, index) => node !== renderedPromptNodes[index])) {
+      const all = document.createDocumentFragment();
+      for (const node of nextNodes) all.appendChild(node);
+      elements.grid.replaceChildren(all);
+    }
+    renderedPromptKeys = nextKeys;
+    renderedPromptNodes = nextNodes;
     elements.empty.classList.toggle('hidden', items.length > 0);
     elements.resultCount.textContent = `${items.length} 条${state.mode === 'templates' ? '模板' : '案例'}`;
     elements.loadMore.classList.toggle('hidden', visible.length >= items.length);
@@ -751,6 +814,7 @@
     const copy = createIconButton('copy', '复制提示词');
     copy.addEventListener('click', () => copyText(itemPrompt(type, item)));
     const favorite = createIconButton('heart', '收藏提示词');
+    article._favoriteButton = favorite;
     favorite.classList.toggle('active', state.favorites.has(itemKey(type, item)));
     favorite.addEventListener('click', () => toggleFavorite(type, item));
     actions.appendChild(tags);

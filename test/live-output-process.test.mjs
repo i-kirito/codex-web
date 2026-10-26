@@ -44,6 +44,7 @@ test('returning to a running conversation keeps its restored process panel attac
   const hydrationEnd = loadSource.indexOf("  if(currentConversationSource==='codex')renderNativeForkDivider(messages);", hydrationStart);
   assert.ok(hydrationStart >= 0 && hydrationEnd > hydrationStart);
   const headerSource = sourceBetween('function ensureTurnProcessHeader', 'function formatMessageTime');
+  const assistantIndexSource = sourceBetween('function resetNativeAssistantIndex', 'function assistantMessageBelongsInProcess');
   const createElement = () => ({
     children: [], dataset: {}, parentNode: null,
     appendChild(element) {
@@ -62,6 +63,8 @@ test('returning to a running conversation keeps its restored process panel attac
   });
   const restore = new Function('chat', 'document', 'conversation', `
     let turnProcessHeader = null, turnProcessTimeline = null, collectingTurnProcess = false;
+    let nativeAssistantBySequence = new Map([[7, { stale: true }]]);
+    let nativeAssistantsByTurn = new Map([['first-turn', [{ stale: true }]]]);
     const webRunActive = conversation.status === 'running';
     const activeNativeTurnId = webRunActive ? 'first-turn' : '';
     const currentConversationSource = 'codex', options = {}, restorePaint = false;
@@ -71,6 +74,7 @@ test('returning to a running conversation keeps its restored process panel attac
     const endDeferredIconRefresh = () => {};
     const messageTokenUsage = () => null;
     ${headerSource}
+    ${assistantIndexSource}
     function beginTurnProcessCollection() { collectingTurnProcess = true; ensureTurnProcessHeader(); }
     function resetTurnProcessCollection() { collectingTurnProcess = false; }
     function addMsg(role, text, options) {
@@ -81,7 +85,12 @@ test('returning to a running conversation keeps its restored process panel attac
       else { ensureTurnProcessHeader(); turnProcessTimeline.appendChild(element); }
     }
     ${loadSource.slice(hydrationStart, hydrationEnd)}
-    return { header: turnProcessHeader, timeline: turnProcessTimeline, addMsg };
+    return {
+      header: turnProcessHeader,
+      timeline: turnProcessTimeline,
+      addMsg,
+      assistantIndexSizes: [nativeAssistantBySequence.size, nativeAssistantsByTurn.size],
+    };
   `);
   const messages = [
     { role: 'user', content: 'First question', turnId: 'first-turn', seq: 1 },
@@ -93,6 +102,7 @@ test('returning to a running conversation keeps its restored process panel attac
   const chat = createElement();
   chat.appendChild(createElement());
   const restored = restore(chat, { createElement }, { status: 'running', messages });
+  assert.deepEqual(restored.assistantIndexSizes, [0, 0], 'loading a snapshot must clear stale assistant indexes');
   assert.equal(restored.header.parentNode, chat, 'restored progress must belong to the current chat');
   assert.deepEqual(restored.timeline.children.map((element) => element.textContent), [
     'Checking the workspace', 'exec_command', 'Reviewing results',
@@ -102,6 +112,7 @@ test('returning to a running conversation keeps its restored process panel attac
   assert.equal(restored.timeline.children.at(-1).textContent, 'Further progress after switching back');
   const completedChat = createElement();
   const completed = restore(completedChat, { createElement }, { status: 'done', messages });
+  assert.deepEqual(completed.assistantIndexSizes, [0, 0]);
   assert.equal(completed.header, null, 'completed history must not open a live panel');
 });
 
@@ -1428,6 +1439,8 @@ test('persisted active commentary renders progressively and deduplicates by sequ
       let nativeLiveItems = new Map();
       let nativeRuntimeStreamTurnIds = new Set();
       let nativeRenderedMessageKeys = new Set();
+      let nativeAssistantBySequence = new Map();
+      let nativeAssistantsByTurn = new Map();
       let nativeLiveScrollTimer = null;
       let nativeLiveFollowBottom = true;
       let nativeLiveReadingHistory = false;
@@ -1690,6 +1703,8 @@ test('runtime stream and snapshot message adopt into one assistant bubble', () =
       let nativeLiveItems = new Map();
       let nativeRuntimeStreamTurnIds = new Set();
       let nativeRenderedMessageKeys = new Set();
+      let nativeAssistantBySequence = new Map();
+      let nativeAssistantsByTurn = new Map();
       let nativeLiveScrollTimer = null;
       let nativeLiveFollowBottom = true;
       let nativeLiveReadingHistory = false;

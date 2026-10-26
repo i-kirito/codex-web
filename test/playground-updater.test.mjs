@@ -9,6 +9,51 @@ import {
   PlaygroundUpdater,
 } from '../playground-updater.mjs';
 
+test('latest release checks share an in-flight request while force bypasses only completed cache', async () => {
+  let calls = 0;
+  let releaseFirst;
+  const first = new Promise((resolve) => { releaseFirst = resolve; });
+  const updater = new PlaygroundUpdater({
+    runtimeDir: '/tmp/playground-runtime',
+    vendorDir: '/tmp/playground-vendor',
+    patchDir: '/tmp/playground-patches',
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) await first;
+      return Response.json({ tag_name: calls === 1 ? 'v1.2.3' : 'v1.2.4' });
+    },
+  });
+  const normal = updater.fetchLatestRelease();
+  const forcedDuringFlight = updater.fetchLatestRelease({ force: true });
+  releaseFirst();
+  assert.deepEqual(await Promise.all([normal, forcedDuringFlight]), [
+    { tag: 'v1.2.3', version: '1.2.3' },
+    { tag: 'v1.2.3', version: '1.2.3' },
+  ]);
+  assert.equal(calls, 1);
+  assert.equal((await updater.fetchLatestRelease()).version, '1.2.3');
+  assert.equal(calls, 1);
+  assert.equal((await updater.fetchLatestRelease({ force: true })).version, '1.2.4');
+  assert.equal(calls, 2);
+});
+
+test('failed latest release checks clear the in-flight request for retry', async () => {
+  let calls = 0;
+  const updater = new PlaygroundUpdater({
+    runtimeDir: '/tmp/playground-runtime',
+    vendorDir: '/tmp/playground-vendor',
+    patchDir: '/tmp/playground-patches',
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('temporary');
+      return Response.json({ tag_name: 'v1.2.3' });
+    },
+  });
+  await assert.rejects(updater.fetchLatestRelease(), /temporary/);
+  assert.equal((await updater.fetchLatestRelease()).version, '1.2.3');
+  assert.equal(calls, 2);
+});
+
 test('playground updater builds into runtime and atomically activates the verified release', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-playground-updater-'));
   const runtimeDir = path.join(temporary, 'runtime');

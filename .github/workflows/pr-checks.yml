@@ -92,7 +92,10 @@ jobs:
             });
             if (!login.ok) throw new Error(`Login failed: ${login.status}`);
             const cookie = login.headers.get("set-cookie").split(";")[0];
-            for (const route of ["/", "/api/config", "/ui.css", "/effects.js", "/image-prompt.js", "/vendor/purify.js"]) {
+            const html = await (await fetch(base + "/", {headers: {cookie}})).text();
+            const assets = [...html.matchAll(/(?:src|href)="(\/assets\/[a-f0-9]{64}\/[^"?]+)"/g)].map(match => match[1]);
+            if (assets.length !== 5) throw new Error("Missing versioned page assets");
+            for (const route of ["/", "/api/config", "/ui.css", "/effects.js", "/image-prompt.js", "/vendor/purify.js", ...assets]) {
               const response = await fetch(base + route, {headers: {cookie}});
               if (!response.ok) throw new Error(`${route}: ${response.status}`);
             }

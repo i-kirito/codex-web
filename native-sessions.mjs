@@ -31,6 +31,7 @@ const DEFAULT_TURN_START_SCAN_BYTES = 32 * 1024 * 1024;
 const TURN_START_RECORD_LIMIT_BYTES = 256 * 1024;
 const DEFAULT_MAX_MESSAGES = 0;
 const DEFAULT_MAX_SESSIONS = 100;
+const DEFAULT_DETAIL_CACHE_MAX_BYTES = 256 * 1024 * 1024;
 const DEFAULT_POLL_INTERVAL_MS = 5000;
 const DEFAULT_RUNNING_WINDOW_MS = 6 * 60 * 60 * 1000;
 const HISTORY_PAGE_TURN_HINT_COUNT = 2;
@@ -68,6 +69,7 @@ export class NativeSessionStore extends EventEmitter {
     );
     this.maxMessages = nonNegativeNumber(options.maxMessages, DEFAULT_MAX_MESSAGES);
     this.maxSessions = positiveNumber(options.maxSessions, DEFAULT_MAX_SESSIONS);
+    this.detailCacheMaxBytes = positiveNumber(options.detailCacheMaxBytes, DEFAULT_DETAIL_CACHE_MAX_BYTES);
     this.pollIntervalMs = positiveNumber(options.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS);
     this.runningWindowMs = positiveNumber(options.runningWindowMs, DEFAULT_RUNNING_WINDOW_MS);
     this.watchChanges = options.watchChanges !== false;
@@ -77,6 +79,7 @@ export class NativeSessionStore extends EventEmitter {
     this.subagentThreads = new Map();
     this.titles = new Map();
     this.details = new Map();
+    this.listStatuses = new Map();
     this.threadGoals = new Map();
     this.clearedThreadGoalIds = new Set();
     this.goalsStamp = '';
@@ -97,6 +100,9 @@ export class NativeSessionStore extends EventEmitter {
     this.stateDbIno = 0;
     this.stateThreadQuery = null;
     this.stateSubagentThreadQuery = null;
+    this.stateDbStamp = '';
+    this.stateThreadRows = null;
+    this.stateSubagentRows = null;
     this.version = 0;
     this.cacheGeneration = 0;
     this.watcher = null;
@@ -165,6 +171,7 @@ export class NativeSessionStore extends EventEmitter {
     const pinnedChangedIds = workspaceState.pinnedChangedIds;
     const completionReadStateChanged = workspaceState.completionReadStateChanged;
     this.refreshAppThreads();
+    const sessionFiles = listSessionFileCandidates(this.sessionsDir);
     const nextEntries = scanSessionFiles(
       this.sessionsDir,
       this.titles,
@@ -172,8 +179,11 @@ export class NativeSessionStore extends EventEmitter {
       (id, cwd) => this.workspaceKindForThread(id, cwd),
       this.sessionMetadataCache,
       (id) => this.workspaceCwdForThread(id),
+      sessionFiles,
     );
-    const nextSubagentEntries = scanSessionFiles(this.sessionsDir, this.titles, this.subagentThreads);
+    const nextSubagentEntries = scanSessionFiles(
+      this.sessionsDir, this.titles, this.subagentThreads, null, null, null, sessionFiles,
+    );
     const conversationChangedIds = [
       ...new Set([
         ...changedSessionIds(this.entries, nextEntries),
@@ -195,6 +205,9 @@ export class NativeSessionStore extends EventEmitter {
 
     for (const id of [...this.details.keys()]) {
       if (!this.entries.has(id) && !this.subagentEntries.has(id)) this.details.delete(id);
+    }
+    for (const id of [...this.listStatuses.keys()]) {
+      if (!this.entries.has(id) && !this.subagentEntries.has(id)) this.listStatuses.delete(id);
     }
 
     if (changedIds.length || completionReadStateChanged) {
@@ -285,10 +298,13 @@ export class NativeSessionStore extends EventEmitter {
   }
 
   readLocalSideChatState() {
+    const empty = () => ({
+      ids: [], sources: {}, ignoredIds: [], projectlessIds: [], legacyProjectlessIds: [], workspaceHints: {}, updatedAt: 0,
+    });
     try {
       const parsed = JSON.parse(readFileSync(this.sideChatStateFile, 'utf8'));
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        return { ids: [], sources: {}, ignoredIds: [], projectlessIds: [], legacyProjectlessIds: [], workspaceHints: {} };
+        return empty();
       }
       const raw = parsed['side-chat-thread-ids'];
       const ids = Array.isArray(raw)
@@ -321,9 +337,12 @@ export class NativeSessionStore extends EventEmitter {
         && !Array.isArray(parsed['thread-workspace-root-hints']))
         ? parsed['thread-workspace-root-hints']
         : {};
-      return { ids, sources, ignoredIds, projectlessIds, legacyProjectlessIds, workspaceHints };
+      return {
+        ids, sources, ignoredIds, projectlessIds, legacyProjectlessIds, workspaceHints,
+        updatedAt: Number(parsed.updatedAt) || 0,
+      };
     } catch {
-      return { ids: [], sources: {}, ignoredIds: [], projectlessIds: [], legacyProjectlessIds: [], workspaceHints: {} };
+      return empty();
     }
   }
 
@@ -365,6 +384,9 @@ export class NativeSessionStore extends EventEmitter {
       'thread-workspace-root-hints': workspaceHints,
       updatedAt: Date.now(),
     };
+    if (existsSync(this.sideChatStateFile) && sameSideChatState(current, payload)) {
+      return { ...payload, updatedAt: current.updatedAt || payload.updatedAt };
+    }
     const temporary = this.sideChatStateFile + '.tmp-' + Date.now() + '-' + Math.random().toString(16).slice(2);
     writeFileSync(temporary, JSON.stringify(payload) + String.fromCharCode(10), { mode: 0o600 });
     renameSync(temporary, this.sideChatStateFile);
@@ -544,6 +566,7 @@ export class NativeSessionStore extends EventEmitter {
     }
 
     try {
+      const nextStamp = sqliteFileStamp(this.stateDbFile);
       if (!this.stateDb || this.stateDbIno !== stat.ino) {
         this.closeStateDb();
         this.stateDb = new DatabaseSync(this.stateDbFile, { readOnly: true, timeout: 500 });
@@ -551,9 +574,14 @@ export class NativeSessionStore extends EventEmitter {
         this.stateThreadQuery = prepareAppThreadQuery(this.stateDb);
         this.stateSubagentThreadQuery = prepareSubagentThreadQuery(this.stateDb);
       }
+      if (this.stateThreadRows === null || this.stateDbStamp !== nextStamp) {
+        this.stateThreadRows = this.stateThreadQuery.all();
+        this.stateSubagentRows = this.stateSubagentThreadQuery?.all() || [];
+        this.stateDbStamp = nextStamp;
+      }
 
       const next = new Map();
-      for (const row of this.stateThreadQuery.all()) {
+      for (const row of this.stateThreadRows) {
         const id = String(row.id || '').trim().toLowerCase();
         const source = String(row.source || '');
         const rolloutPath = String(row.rollout_path || '').trim();
@@ -586,7 +614,7 @@ export class NativeSessionStore extends EventEmitter {
       this.appThreads = next;
 
       const nextSubagents = new Map();
-      for (const row of this.stateSubagentThreadQuery?.all() || []) {
+      for (const row of this.stateSubagentRows || []) {
         const id = String(row.id || '').trim().toLowerCase();
         const rolloutPath = String(row.rollout_path || '').trim();
         const spawn = parseSubagentThreadSource(row.source);
@@ -617,6 +645,9 @@ export class NativeSessionStore extends EventEmitter {
     this.stateDbIno = 0;
     this.stateThreadQuery = null;
     this.stateSubagentThreadQuery = null;
+    this.stateDbStamp = '';
+    this.stateThreadRows = null;
+    this.stateSubagentRows = null;
   }
 
   refreshThreadGoals() {
@@ -792,28 +823,49 @@ export class NativeSessionStore extends EventEmitter {
       const cleanId = String(id || '').trim().toLowerCase();
       if (this.entries.has(cleanId)) selectedIds.add(cleanId);
     }
-    return sortedEntries
+    const summaries = sortedEntries
       .filter((entry) => selectedIds.has(entry.id))
       .map((entry) => {
         let historyFailed = false;
         let cached = this.details.get(entry.id);
         let cacheIsCurrent = cached
           && cached.filePath === entry.filePath
-          && cached.size === entry.size;
+          && cached.ino === entry.ino
+          && cached.size === entry.size
+          && cached.mtimeMs === entry.mtimeMs;
+        let listStatus = this.listStatuses.get(entry.id);
+        let listStatusIsCurrent = listStatus
+          && listStatus.filePath === entry.filePath
+          && listStatus.ino === entry.ino
+          && listStatus.size === entry.size
+          && listStatus.mtimeMs === entry.mtimeMs;
 
         // A recent mtime only means the session changed, not that its turn is
         // still running. Parse changed recent sessions so a task_complete at
         // the end of the JSONL is reflected in the sidebar immediately.
-        if (!cacheIsCurrent && now - entry.mtimeMs <= this.runningWindowMs) {
+        if (!cacheIsCurrent && !listStatusIsCurrent && now - entry.mtimeMs <= this.runningWindowMs) {
+          const hadDetail = this.details.has(entry.id);
           try { this.get(entry.id); } catch { historyFailed = true; }
           cached = this.details.get(entry.id);
           cacheIsCurrent = cached
             && cached.filePath === entry.filePath
-            && cached.size === entry.size;
+            && cached.ino === entry.ino
+            && cached.size === entry.size
+            && cached.mtimeMs === entry.mtimeMs;
+          if (!hadDetail && cacheIsCurrent && cached.status !== 'running') {
+            this.listStatuses.set(entry.id, sessionListStatus(entry, cached.status, cached.generation));
+            listStatus = this.listStatuses.get(entry.id);
+            listStatusIsCurrent = true;
+            this.details.delete(entry.id);
+            cached = null;
+            cacheIsCurrent = false;
+          }
         }
 
         const status = historyFailed ? 'error' : cacheIsCurrent
           ? effectiveSessionStatus(cached.status, entry.mtimeMs, this.runningWindowMs, now)
+          : listStatusIsCurrent
+            ? effectiveSessionStatus(listStatus.status, entry.mtimeMs, this.runningWindowMs, now)
           : 'done';
         const summary = sessionSummary(entry, status);
         if (this.isSideChatThread(entry.id)) {
@@ -822,6 +874,8 @@ export class NativeSessionStore extends EventEmitter {
         }
         return summary;
       });
+    this.enforceDetailCacheLimit();
+    return summaries;
   }
 
   get(id, options = {}) {
@@ -905,7 +959,16 @@ export class NativeSessionStore extends EventEmitter {
     if (!entry) return null;
 
     let cache = this.details.get(id);
+    let preservedGeneration = 0;
     if (!cache || cache.filePath !== entry.filePath || cache.ino !== entry.ino || entry.size < cache.offset) {
+      const listStatus = this.listStatuses.get(id);
+      if (listStatus
+        && listStatus.filePath === entry.filePath
+        && listStatus.ino === entry.ino
+        && listStatus.size === entry.size
+        && listStatus.mtimeMs === entry.mtimeMs) {
+        preservedGeneration = Number(listStatus.generation) || 0;
+      }
       cache = createDetailCache(entry, {
         generation: ++this.cacheGeneration,
         maxReadBytes: this.maxReadBytes,
@@ -922,6 +985,8 @@ export class NativeSessionStore extends EventEmitter {
     }
 
     readSessionUpdates(cache, entry, this.maxMessages, this);
+    if (preservedGeneration > 0) cache.generation = preservedGeneration;
+    cache.lastAccessedAt = Date.now();
     this.applyPersistedThreadSettings(cache, entry);
     if (cache.status === 'running' && cache.latestTurnId && !cache.currentTurnStartedAt && !cache.turnStartScanComplete) {
       cache.currentTurnStartedAt = findTurnStartedAtBeforeOffset(
@@ -939,7 +1004,41 @@ export class NativeSessionStore extends EventEmitter {
       cache,
       this.clearedThreadGoalIds.has(entry.id) ? null : resolveThreadGoal(cache.goal, dbGoal),
     );
-    return buildConversation(entry, cache, options, this.runningWindowMs);
+    const conversation = buildConversation(entry, cache, options, this.runningWindowMs);
+    this.enforceDetailCacheLimit(new Set([entry.id]));
+    return conversation;
+  }
+
+  enforceDetailCacheLimit(preserveIds = new Set()) {
+    let total = 0;
+    const now = Date.now();
+    const candidates = [];
+    for (const [id, cache] of this.details) {
+      const bytes = Math.max(0, Number(cache.size) || 0);
+      total += bytes;
+      const entry = this.entries.get(id) || this.subagentEntries.get(id);
+      const status = entry
+        ? effectiveSessionStatus(cache.status, entry.mtimeMs, this.runningWindowMs, now)
+        : cache.status;
+      if (status !== 'running' && !preserveIds.has(id)) candidates.push([id, cache, bytes]);
+    }
+    if (total <= this.detailCacheMaxBytes) return;
+    candidates.sort((left, right) => (left[1].lastAccessedAt || 0) - (right[1].lastAccessedAt || 0));
+    for (const [id, cache, bytes] of candidates) {
+      const entry = this.entries.get(id) || this.subagentEntries.get(id);
+      if (entry
+        && cache.filePath === entry.filePath
+        && cache.ino === entry.ino
+        && cache.size === entry.size
+        && cache.mtimeMs === entry.mtimeMs) {
+        this.listStatuses.set(id, sessionListStatus(entry, cache.status, cache.generation));
+      } else {
+        this.listStatuses.delete(id);
+      }
+      this.details.delete(id);
+      total -= bytes;
+      if (total <= this.detailCacheMaxBytes) break;
+    }
   }
 
   getMessage(id, sequence, generation) {
@@ -1086,29 +1185,11 @@ function scanSessionFiles(
   workspaceKindForThread = null,
   sessionMetadataCache = null,
   workspaceCwdForThread = null,
+  candidates = null,
 ) {
   const entries = new Map();
   if (!existsSync(root)) return entries;
-  const pending = [root];
-
-  while (pending.length) {
-    const directory = pending.pop();
-    let children = [];
-    try {
-      children = readdirSync(directory, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-
-    for (const child of children) {
-      const filePath = path.join(directory, child.name);
-      if (child.isDirectory()) {
-        pending.push(filePath);
-        continue;
-      }
-      if (!child.isFile()) continue;
-      const id = child.name.match(SESSION_FILE_PATTERN)?.[1]?.toLowerCase();
-      if (!id) continue;
+  for (const { filePath, id } of candidates || listSessionFileCandidates(root)) {
       const appThread = appThreads?.get(id);
       if (appThreads && !appThread) continue;
       if (appThread?.rolloutPath && !sameLocalPath(filePath, appThread.rolloutPath)) continue;
@@ -1147,10 +1228,31 @@ function scanSessionFiles(
         const previous = entries.get(id);
         if (!previous || entry.recencyMs > previous.recencyMs) entries.set(id, entry);
       } catch {}
-    }
   }
 
   return entries;
+}
+
+function listSessionFileCandidates(root) {
+  const files = [];
+  if (!existsSync(root)) return files;
+  const pending = [root];
+  while (pending.length) {
+    const directory = pending.pop();
+    let children = [];
+    try { children = readdirSync(directory, { withFileTypes: true }); } catch { continue; }
+    for (const child of children) {
+      const filePath = path.join(directory, child.name);
+      if (child.isDirectory()) {
+        pending.push(filePath);
+        continue;
+      }
+      if (!child.isFile()) continue;
+      const id = child.name.match(SESSION_FILE_PATTERN)?.[1]?.toLowerCase();
+      if (id) files.push({ filePath, id });
+    }
+  }
+  return files;
 }
 
 function isGeneratedProjectlessWorkspace(cwd, root) {
@@ -1218,6 +1320,31 @@ function sameLocalPath(left, right) {
   return normalize(left) === normalize(right);
 }
 
+function sameSideChatState(current, next) {
+  const snapshot = (value) => JSON.stringify({
+    'side-chat-thread-ids': value?.['side-chat-thread-ids'] || value?.ids || [],
+    'side-chat-source-threads': value?.['side-chat-source-threads'] || value?.sources || {},
+    'ignored-side-chat-thread-ids': value?.['ignored-side-chat-thread-ids'] || value?.ignoredIds || [],
+    'projectless-thread-ids': value?.['projectless-thread-ids'] || value?.projectlessIds || [],
+    'legacy-projectless-thread-ids': value?.['legacy-projectless-thread-ids'] || value?.legacyProjectlessIds || [],
+    'thread-workspace-root-hints': value?.['thread-workspace-root-hints'] || value?.workspaceHints || {},
+  });
+  return snapshot(current) === snapshot(next);
+}
+
+function sqliteFileStamp(file) {
+  const parts = [];
+  for (const suffix of ['', '-wal']) {
+    try {
+      const stat = statSync(file + suffix);
+      parts.push(`${suffix}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`);
+    } catch {
+      parts.push(`${suffix}:missing`);
+    }
+  }
+  return parts.join('|');
+}
+
 function changedSessionIds(previous, next) {
   const changed = new Set();
   for (const [id, entry] of next) {
@@ -1246,6 +1373,17 @@ function sessionSummary(entry, status) {
     updatedAt: entry.updatedAt,
     status,
     readOnly: false,
+  };
+}
+
+function sessionListStatus(entry, status, generation = 0) {
+  return {
+    filePath: entry.filePath,
+    ino: entry.ino,
+    size: entry.size,
+    mtimeMs: entry.mtimeMs,
+    status,
+    generation: Number(generation) || 0,
   };
 }
 
@@ -1321,6 +1459,7 @@ function createDetailCache(entry, options, store) {
     lastTimestamp: '',
     subagentTurnIds: new Set(),
     contentMutated: false,
+    lastAccessedAt: Date.now(),
   };
 
   const firstRecord = readFirstRecord(entry.filePath);

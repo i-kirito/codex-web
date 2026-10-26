@@ -34,6 +34,7 @@ export class PlaygroundUpdater {
     this.currentDir = path.join(this.runtimeDir, 'current');
     this.previousDir = path.join(this.runtimeDir, 'previous');
     this.latestCache = null;
+    this.latestPromise = null;
     this.startPromise = null;
     this.updatePromise = null;
     this.state = {
@@ -140,28 +141,35 @@ export class PlaygroundUpdater {
     if (!force && this.latestCache && Date.now() - this.latestCache.checkedAt <= LATEST_CACHE_MS) {
       return this.latestCache.release;
     }
+    if (this.latestPromise) return this.latestPromise;
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15_000);
-    try {
-      const response = await this.fetchImpl(this.releaseApi, {
-        headers: {
-          Accept: 'application/vnd.github+json',
-          'User-Agent': 'codex-web-playground-updater',
-        },
-        signal: controller.signal,
-      });
-      if (!response.ok) throw new Error(`GitHub Release 检查失败：HTTP ${response.status}`);
-      const payload = await response.json();
-      const tag = String(payload?.tag_name || '').trim();
-      const match = tag.match(STABLE_TAG_PATTERN);
-      if (!match || payload?.draft || payload?.prerelease) throw new Error('GitHub 未返回有效的稳定版本');
-      const release = { tag, version: `${match[1]}.${match[2]}.${match[3]}` };
-      this.latestCache = { checkedAt: Date.now(), release };
-      return release;
-    } finally {
-      clearTimeout(timer);
-    }
+    const pending = (async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15_000);
+      try {
+        const response = await this.fetchImpl(this.releaseApi, {
+          headers: {
+            Accept: 'application/vnd.github+json',
+            'User-Agent': 'codex-web-playground-updater',
+          },
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`GitHub Release 检查失败：HTTP ${response.status}`);
+        const payload = await response.json();
+        const tag = String(payload?.tag_name || '').trim();
+        const match = tag.match(STABLE_TAG_PATTERN);
+        if (!match || payload?.draft || payload?.prerelease) throw new Error('GitHub 未返回有效的稳定版本');
+        const release = { tag, version: `${match[1]}.${match[2]}.${match[3]}` };
+        this.latestCache = { checkedAt: Date.now(), release };
+        return release;
+      } finally {
+        clearTimeout(timer);
+      }
+    })().finally(() => {
+      if (this.latestPromise === pending) this.latestPromise = null;
+    });
+    this.latestPromise = pending;
+    return pending;
   }
 
   async performUpdate(current, release) {

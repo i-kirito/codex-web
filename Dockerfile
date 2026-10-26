@@ -34,7 +34,7 @@ COPY server.mjs automation-store.mjs app-server-client.mjs desktop-ipc-client.mj
      image-prompt-library.mjs image-prompt.js image-prompt.css native-sessions.mjs \
      native-writer-lock.mjs account-analytics.mjs native-thread-archive.mjs \
      chatgpt-conversations.mjs cwd-migrations.mjs cycle-usage.mjs message-media.mjs \
-     playground-updater.mjs plugins-catalog.mjs skills-catalog.mjs sub-quota.mjs \
+     playground-updater.mjs plugins-catalog.mjs skills-catalog.mjs sub-quota.mjs page-assets.mjs \
      effects.js ui.css ./
 COPY scripts ./scripts
 COPY vendor ./vendor
