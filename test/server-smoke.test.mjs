@@ -7298,7 +7298,7 @@ updated_at = 1784422800000
     assert.match(page, /async function changeComposerProvider\(nextProvider\)[\s\S]*?syncNativeComposerSettings\(\{provider:requestedProvider,model:model\.value\}\)/);
     assert.match(page, /const settingsReady=await syncNativeComposerSettings[\s\S]*?return settingsReady/);
     assert.match(page, /function requestComposerProviderChange\(nextProvider\)[\s\S]*?composerProviderChangePromise=pending\.catch\(\(\)=>false\)/);
-    assert.match(page, /const providerReady=await waitForLatestComposerProviderChange\(\);\s*const modelReady=await waitForLatestComposerModelLoad\(\);\s*await nativeComposerSettingsQueue\.catch\(\(\)=>false\);[\s\S]*?if\(providerReady===false\|\|modelReady===false\)/);
+    assert.match(page, /const providerReady=await waitForLatestComposerProviderChange\(\);\s*const modelReady=await waitForLatestComposerModelLoad\(\);\s*const settingsReady=await waitForLatestNativeComposerSettings\(sendConversationId\);[\s\S]*?if\(providerReady===false\|\|modelReady===false\)[\s\S]*?if\(settingsReady===false\)/);
     assert.match(page, /const revision=\+\+modelLoadRevision[\s\S]*?revision!==modelLoadRevision/);
     assert.match(page, /modelListCache\.has\(requestedProvider\)/);
     assert.match(page, /model\.innerHTML='<option value="">获取模型中\.\.\.<\/option>';\s*if\(typeof syncComposerChrome==='function'\)syncComposerChrome\(\)/);
@@ -7309,8 +7309,8 @@ updated_at = 1784422800000
     assert.match(page, /model\?\.addEventListener\('change',\(\)=>\{\s*if\(!composerModelSwitchConfirm\(composerModelValueBeforeChange,model\.value\)\)return;[\s\S]*?syncComposerChrome\(\)\}\)/);
     assert.match(page, /payload\.provider=String\(changes\.provider\|\|''\)\.trim\(\)\|\|null/);
     assert.match(page, /reasoningEffort\?\.addEventListener\('change',\(\)=>\{void syncNativeComposerSettings\(\{reasoningEffort:reasoningEffort\.value\}\);syncComposerChrome\(\)\}\)/);
-    assert.match(page, /nativeComposerOverride=\{threadId:currentConversationId,provider:[^}]*pending:Boolean\(pending\),writeId:Number\(writeId\)\|\|0\}/);
-    assert.match(page, /function nativeComposerOverrideApplies\(threadId\)\{return Boolean\(nativeComposerOverride\?\.pending/);
+    assert.match(page, /nativeComposerOverride=\{threadId:currentConversationId,provider:[^}]*pending:startsWrite\|\|Boolean\(previous\?\.pending\),confirmed:startsWrite\?false:Boolean\(previous\?\.confirmed\),expected:startsWrite\?null:previous\?\.expected\|\|null,writeId:Number\(writeId\)\|\|Number\(previous\?\.writeId\)\|\|0\}/);
+    assert.match(page, /function nativeComposerOverrideApplies\(threadId,metadata=null\)[\s\S]*?nativeComposerMetadataAcknowledges\(override,metadata\)[\s\S]*?return true/);
     assert.match(page, /if\(!preserveProviderModel&&Object\.hasOwn\(metadata,'reasoningEffort'\)\)/);
     assert.match(page, /if\(!preserveProviderModel&&Object\.hasOwn\(metadata,'modelProvider'\)\)/);
     assert.match(page, /let modelProviderMetadataHandled=false/);
@@ -7320,7 +7320,8 @@ updated_at = 1784422800000
     assert.match(page, /selectComposerModel\(selectedModel\)/);
     assert.match(page, /function resetComposerProviderChange\(\)\{composerProviderChangePromise=Promise\.resolve\(true\)\}/);
     assert.match(page, /if\(conversationChanged\)\{clearNativeCancelPending\(\);resetComposerProviderChange\(\)\}/);
-    assert.match(page, /clearNativeComposerOverride\(\);\s*syncComposerChrome\(\);\s*void syncCurrentNativeConversation\(\)/);
+    assert.match(page, /override\.confirmed=true;[\s\S]*?override\.expected=\{\.\.\.payload[\s\S]*?void syncCurrentNativeConversation\(\)/);
+    assert.match(page, /if\(override\?\.writeId===writeId\)clearNativeComposerOverride\(threadId\)/);
     assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,\{pending:true\}\)/);
     assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,\{pending:true\}\)/);
     assert.match(page, /body:JSON\.stringify\(\{message,attachments,provider:requestedProvider,model:requestedModel/);
@@ -7345,8 +7346,8 @@ updated_at = 1784422800000
     assert.match(page, /row\.button\.classList\.toggle\('active',kind===activeKind\)/);
     assert.match(page, /row\.button\.setAttribute\('aria-expanded',String\(kind===activeKind\)\)/);
     assert.match(page, /运行中修改将用于下一条消息/);
-    assert.match(page, /const conversation=data\.conversation;\s*nativeHistoryNextPageLimit=normalizeNativeHistoryPageLimit\(Math\.max\([\s\S]*?Number\(conversation\.nextHistoryPageLimit\)\|\|0,[\s\S]*?\)\);\s*currentNativeRunStatus=String\(conversation\.status\|\|''\);[\s\S]*?await applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\)/);
-    assert.match(page, /await applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*if\(seq!==conversationLoadSeq\|\|currentConversationSource!=='codex'\|\|currentConversationId!==id\)return;\s*if\(deferNativeSyncForHistoryPage\(\)\)return;\s*syncComposerContextWindow\(conversation\.contextWindow\|\|null\)/);
+    assert.match(page, /const conversation=data\.conversation;\s*nativeHistoryNextPageLimit=normalizeNativeHistoryPageLimit\(Math\.max\([\s\S]*?Number\(conversation\.nextHistoryPageLimit\)\|\|0,[\s\S]*?\)\);\s*currentNativeRunStatus=String\(conversation\.status\|\|''\);[\s\S]*?const staleSettingsSnapshot=nativeComposerSnapshotIsStale\(id,nativeSettingsRevisionAtRequest\);\s*await applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{threadId:id,preserveProviderModel:staleSettingsSnapshot\|\|nativeComposerOverrideApplies\(id,conversation\.metadata\|\|\{\}\)\}\)/);
+    assert.match(page, /await applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{threadId:id,preserveProviderModel:staleSettingsSnapshot\|\|nativeComposerOverrideApplies\(id,conversation\.metadata\|\|\{\}\)\}\);\s*if\(seq!==conversationLoadSeq\|\|currentConversationSource!=='codex'\|\|currentConversationId!==id\)return;\s*if\(deferNativeSyncForHistoryPage\(\)\)return;\s*syncComposerContextWindow\(conversation\.contextWindow\|\|null\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
@@ -7559,6 +7560,9 @@ updated_at = 1784422800000
     const metadataApplier = new Function(
       'loadModels',
       `let currentNativeWorkspaceKind='';
+       let currentConversationSource='codex';
+       let currentConversationId='thread';
+       function nativeComposerOverrideFor(){return null}
        let forceFullAccess=false;
        let modelLoadRevision=0;
        let modelOptionsProvider='other';
@@ -7626,6 +7630,7 @@ updated_at = 1784422800000
       'syncNativeComposerSettings',
       'clearNativeComposerOverride',
       'syncCurrentNativeConversation',
+      'nativeComposerOverrideFor',
       `let currentConversationSource='codex';
        let currentConversationId='thread-a';
        let nativeComposerOverride={threadId:'thread-a',provider:'beta'};
@@ -7643,6 +7648,7 @@ updated_at = 1784422800000
       syncNativeComposerSettings,
       () => {},
       () => {},
+      () => ({ threadId: 'thread-a', provider: 'beta' }),
     );
     let settingsWrites = 0;
     const rejectedProviderChange = buildProviderChange(

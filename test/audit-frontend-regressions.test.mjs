@@ -40,6 +40,8 @@ function sendHarness(initialThreadId = 'A') {
     canResumeInterruptedNativeTask: () => false,
     waitForLatestComposerProviderChange: async () => true,
     waitForLatestComposerModelLoad: async () => true,
+    waitForLatestNativeComposerSettings: async () => true,
+    nativeComposerOverrideFor: (threadId) => env.nativeComposerOverride?.threadId === threadId ? env.nativeComposerOverride : null,
     composerPermissionPayload: () => ({}),
     clearPendingAttachments: () => { env.pendingAttachments = []; },
     markPromptQueueTurnRunning: (id, turn) => locks.set(id, turn),
@@ -148,6 +150,31 @@ test('post-send delayed refresh does not touch a task selected after the respons
   await h.timers[0]();
   assert.deepEqual(h.uiCalls, []);
   assert.equal(h.env.nativeComposerOverride, override);
+});
+
+test('a send receipt preserves a newer model write in the same task', async () => {
+  const h = sendHarness();
+  const sending = h.env.send();
+  await h.requestStarted;
+  const newer = { threadId: 'A', model: 'new-model', writeId: 7, pending: true };
+  h.env.nativeComposerOverride = newer;
+  h.respond();
+  await sending;
+  assert.equal(h.env.nativeComposerOverride, newer);
+  await h.timers[0]();
+  assert.equal(h.env.nativeComposerOverride, newer);
+});
+
+test('post-send delayed cleanup cannot clear a model write started after the receipt', async () => {
+  const h = sendHarness();
+  const sending = h.env.send();
+  await h.requestStarted;
+  h.respond();
+  await sending;
+  const newer = { threadId: 'A', model: 'new-model', writeId: 8, pending: true };
+  h.env.nativeComposerOverride = newer;
+  await h.timers[0]();
+  assert.equal(h.env.nativeComposerOverride, newer);
 });
 
 test('a failed send can be recovered only in its original task without overwriting an existing draft', async () => {

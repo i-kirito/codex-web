@@ -1375,9 +1375,30 @@ test('mid-run model switch overlay survives newer turn_context and stale sqlite 
         payload: { turn_id: 'turn-1', model: 'gpt-5.6-sol', effort: 'ultra' },
       },
       {
+        timestamp: '2026-08-14T10:00:00.150Z',
+        type: 'event_msg',
+        payload: {
+          type: 'thread_settings_applied',
+          // This historical value deliberately matches the later Web override.
+          // Replaying it must not retire that newer override before a following
+          // old turn_context is parsed.
+          thread_settings: { model: 'grok-4.5', reasoning_effort: 'high' },
+        },
+      },
+      {
+        timestamp: '2026-08-14T10:00:00.175Z',
+        type: 'turn_context',
+        payload: { turn_id: 'turn-1', model: 'gpt-5.6-sol', effort: 'ultra' },
+      },
+      {
         timestamp: '2026-08-14T10:00:00.200Z',
         type: 'event_msg',
         payload: { type: 'task_started', turn_id: 'turn-1' },
+      },
+      {
+        timestamp: '2026-08-14T10:00:00.300Z',
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'turn-1' },
       },
     ]));
 
@@ -1403,17 +1424,83 @@ test('mid-run model switch overlay survives newer turn_context and stale sqlite 
     assert.equal(store.get(id)?.metadata.model, 'grok-4.5');
     assert.equal(store.get(id)?.metadata.reasoningEffort, 'high');
 
-    // A later settings event still applies normally.
+    // An older SQLite snapshot cannot confirm the overlay merely because its
+    // value happens to match. The later historical turn_context would otherwise
+    // become visible after a full rebuild.
+    const entry = store.entries.get(id);
+    store.entries.set(id, {
+      ...entry,
+      threadSettings: {
+        modelProvider: 'custom',
+        model: 'grok-4.5',
+        reasoningEffort: 'high',
+      },
+      settingsUpdatedAtMs: Date.parse('2026-08-14T10:00:00.120Z'),
+    });
+    store.detailCacheMaxBytes = 1;
+    store.enforceDetailCacheLimit();
+    assert.equal(store.details.has(id), false, 'completed detail is evicted before a full rebuild');
+    assert.equal(store.get(id)?.metadata.model, 'grok-4.5');
+    assert.equal(store.get(id)?.metadata.reasoningEffort, 'high');
+    assert.equal(store.threadSettingsOverrides.has(id), true);
+
+    // A stale SQLite snapshot also remains subordinate when unrelated activity
+    // advances its generic updated_at timestamp but its setting values differ.
+    const rebuiltEntry = store.entries.get(id);
+    store.entries.set(id, {
+      ...rebuiltEntry,
+      threadSettings: {
+        modelProvider: 'custom',
+        model: 'gpt-5.6-sol',
+        reasoningEffort: 'ultra',
+      },
+      settingsUpdatedAtMs: Date.now() + 60_000,
+    });
+    store.enforceDetailCacheLimit();
+    assert.equal(store.get(id)?.metadata.model, 'grok-4.5');
+    assert.equal(store.get(id)?.metadata.reasoningEffort, 'high');
+    assert.equal(store.threadSettingsOverrides.has(id), true);
+
+    // A genuinely newer Desktop settings event takes ownership of the fields it
+    // carries and releases the temporary overlay instead of locking it forever.
+    const webSettingsAtMs = store.threadSettingsOverrides.get(id).updatedAtMs;
+    const desktopSettingsAtMs = webSettingsAtMs + 120_000;
+    const desktopSettingsAt = new Date(desktopSettingsAtMs).toISOString();
     await appendFile(sessionFile, jsonl([{
-      timestamp: '2026-08-14T10:00:02.000Z',
+      timestamp: desktopSettingsAt,
       type: 'event_msg',
       payload: {
         type: 'thread_settings_applied',
-        thread_settings: { model: 'gpt-5.6-terra', reasoning_effort: 'xhigh' },
+        thread_settings: { reasoning_effort: 'xhigh' },
       },
     }]));
     store.refresh();
-    assert.equal(store.get(id)?.metadata.model, 'gpt-5.6-terra');
+    assert.equal(store.get(id)?.metadata.model, 'grok-4.5');
+    assert.equal(store.get(id)?.metadata.reasoningEffort, 'xhigh');
+    assert.equal(store.get(id)?.metadata.settingsUpdatedAtMs, desktopSettingsAtMs);
+    assert.deepEqual(
+      Object.keys(store.threadSettingsOverrides.get(id)).sort(),
+      ['model', 'updatedAtMs'],
+      'the newer Desktop effort retires only that field from the Web overlay',
+    );
+
+    // A late-written context whose timestamp falls between the Web and Desktop
+    // settings must not overwrite either the retained model or newer effort.
+    await appendFile(sessionFile, jsonl([{
+      timestamp: new Date(webSettingsAtMs + 60_000).toISOString(),
+      type: 'turn_context',
+      payload: { turn_id: 'turn-2', model: 'gpt-5.6-sol', effort: 'ultra' },
+    }]));
+    store.refresh();
+    assert.equal(store.get(id)?.metadata.model, 'grok-4.5');
+    assert.equal(store.get(id)?.metadata.reasoningEffort, 'xhigh');
+    assert.equal(store.get(id)?.metadata.settingsUpdatedAtMs, desktopSettingsAtMs);
+
+    // Replaying the complete history again keeps the newer Desktop event above
+    // both the older matching event and the stale SQLite snapshot.
+    store.enforceDetailCacheLimit();
+    assert.equal(store.details.has(id), false);
+    assert.equal(store.get(id)?.metadata.model, 'grok-4.5');
     assert.equal(store.get(id)?.metadata.reasoningEffort, 'xhigh');
   } finally {
     store?.stop();

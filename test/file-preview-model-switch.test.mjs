@@ -137,8 +137,13 @@ test('model-only composer writes omit provider and preserve the requested model'
   const context = vm.createContext({
     currentConversationSource: 'codex', currentConversationId: 'thread', nativeComposerSettingsWriteId: 0,
     nativeComposerSettingsError: null,
-    nativeComposerSettingsQueue: Promise.resolve(), nativeComposerOverride: null,
-    rememberNativeComposerOverride() {},
+    nativeComposerSettingsQueue: Promise.resolve(), nativeComposerSettingsWrites: new Map(),
+    nativeComposerOverride: null, nativeComposerOverrides: new Map(), nativeComposerSettingsRevisions: new Map(),
+    rememberNativeComposerOverride({ writeId }) { const value = { threadId: 'thread', writeId, pending: true }; context.nativeComposerOverride = value; context.nativeComposerOverrides.set('thread', value); },
+    nativeComposerOverrideFor(id) { return context.nativeComposerOverrides.get(id) || null; },
+    clearNativeComposerOverride(id) { context.nativeComposerOverrides.delete(id); context.nativeComposerOverride = null; },
+    bumpNativeComposerSettingsRevision() {},
+    syncComposerChrome() {}, syncCurrentNativeConversation() {},
     fetch: async (url, options) => { request = JSON.parse(options.body); return { ok: true, json: async () => ({}) }; },
   });
   vm.runInContext(between('function syncNativeComposerSettings(', '\nfunction newChat('), context);
@@ -165,6 +170,7 @@ test('the default model catalog uses the signed-in Codex catalog without demandi
 test('refreshing an OpenAI task restores its model even when the provider picker uses the default alias', async () => {
   const selected = [];
   const context = vm.createContext({
+    currentConversationSource: 'codex', currentConversationId: 'thread', nativeComposerOverrideFor: () => null,
     currentNativeWorkspaceKind: '', forceFullAccess: true,
     provider: { options: [{ value: '' }, { value: 'custom' }], value: 'custom' },
     modelOptionsProvider: '', modelLoadInFlight: null, modelLoadRevision: 1,
@@ -176,4 +182,159 @@ test('refreshing an OpenAI task restores its model even when the provider picker
   await context.applyNativeConversationMetadata({ modelProvider: 'openai', model: 'gpt-6-astra' });
   assert.equal(context.provider.value, '');
   assert.deepEqual(selected, ['gpt-6-astra']);
+});
+
+test('a confirmed composer write protects stale snapshots until matching metadata acknowledges it', async () => {
+  let release;
+  const context = vm.createContext({
+    currentConversationSource: 'codex', currentConversationId: 'thread', nativeComposerSettingsWriteId: 0,
+    nativeComposerSettingsError: null, nativeComposerSettingsQueue: Promise.resolve(), nativeComposerSettingsWrites: new Map(),
+    nativeComposerOverride: null, nativeComposerOverrides: new Map(), nativeComposerSettingsRevisions: new Map(),
+    provider: { value: 'openai', options: [{ value: 'openai' }] }, model: { value: 'new-model', options: [{ value: 'new-model' }] },
+    reasoningEffort: { value: 'high' }, composerServiceTier: null, composerPermissionMode: 'legacy', sandbox: { value: '' }, approval: { value: '' },
+    normalizeComposerServiceTier: value => value, syncComposerChrome() {}, syncCurrentNativeConversation() {}, statusEl: { textContent: '' },
+    fetch: () => new Promise(resolve => { release = resolve; }),
+  });
+  vm.runInContext(between('function nativeComposerOverrideFor(', '\nfunction newChat('), context);
+  const oldRequestRevision = context.nativeComposerSettingsRevision('thread');
+  const write = context.syncNativeComposerSettings({ model: 'new-model' });
+  const pendingRequestRevision = context.nativeComposerSettingsRevision('thread');
+  assert.equal(context.nativeComposerOverrideApplies('thread', { modelProvider: 'openai', model: 'old-model' }), true);
+  await new Promise(resolve => setImmediate(resolve));
+  release({ ok: true, json: async () => ({ model: 'new-model' }) });
+  assert.equal(await write, true);
+  assert.equal(context.nativeComposerOverrideApplies('thread', { modelProvider: 'openai', model: 'old-model' }), true);
+  assert.equal(context.nativeComposerOverrideApplies('thread', { modelProvider: 'openai', model: 'new-model' }), false);
+  assert.equal(context.nativeComposerOverrides.has('thread'), false);
+  assert.equal(context.nativeComposerSnapshotIsStale('thread', oldRequestRevision), true);
+  assert.equal(context.nativeComposerSnapshotIsStale('thread', pendingRequestRevision), true);
+});
+
+test('rapid and cross-conversation model writes retain the latest expected value per thread', async () => {
+  const releases = [];
+  const requests = [];
+  const context = vm.createContext({
+    currentConversationSource: 'codex', currentConversationId: 'alpha', nativeComposerSettingsWriteId: 0,
+    nativeComposerSettingsError: null, nativeComposerSettingsQueue: Promise.resolve(), nativeComposerSettingsWrites: new Map(),
+    nativeComposerOverride: null, nativeComposerOverrides: new Map(), nativeComposerSettingsRevisions: new Map(),
+    provider: { value: 'openai', options: [{ value: 'openai' }] }, model: { value: 'one', options: [{ value: 'one' }, { value: 'two' }] },
+    reasoningEffort: { value: '' }, composerServiceTier: null, composerPermissionMode: 'legacy', sandbox: { value: '' }, approval: { value: '' },
+    normalizeComposerServiceTier: value => value, syncComposerChrome() {}, syncCurrentNativeConversation() {}, statusEl: { textContent: '' },
+    fetch: (_url, options) => { requests.push(JSON.parse(options.body)); return new Promise(resolve => releases.push(resolve)); },
+  });
+  vm.runInContext(between('function nativeComposerOverrideFor(', '\nfunction newChat('), context);
+  const first = context.syncNativeComposerSettings({ model: 'one' });
+  context.model.value = 'two';
+  const second = context.syncNativeComposerSettings({ model: 'two' });
+  context.currentConversationId = 'beta';
+  context.activateNativeComposerOverride('beta');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(requests, [{ model: 'one' }]);
+  releases.shift()({ ok: true, json: async () => ({ model: 'one' }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(requests, [{ model: 'one' }, { model: 'two' }]);
+  releases.shift()({ ok: true, json: async () => ({ model: 'two' }) });
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  context.currentConversationId = 'alpha';
+  context.activateNativeComposerOverride('alpha');
+  assert.equal(context.nativeComposerOverrideFor('alpha').expected.model, 'two');
+  assert.equal(context.nativeComposerOverrideApplies('alpha', { model: 'one' }), true);
+  assert.equal(context.nativeComposerOverrideApplies('alpha', { model: 'two' }), false);
+});
+
+test('metadata loading cannot restore an old model after a newer selection starts', async () => {
+  let releaseModels;
+  const selected = [];
+  const overrides = new Map();
+  const context = vm.createContext({
+    currentConversationSource: 'codex', currentConversationId: 'thread', nativeComposerOverrides: overrides, nativeComposerOverrideFor: id => overrides.get(id) || null,
+    currentNativeWorkspaceKind: '', forceFullAccess: false, provider: { options: [{ value: 'openai' }], value: 'openai' },
+    modelOptionsProvider: 'other', modelLoadInFlight: null, modelLoadRevision: 1, defaultComposerServiceTier: null,
+    composerPermissionMode: 'legacy', sandbox: { value: '' }, approval: { value: '' }, reasoningEffort: { value: '' },
+    isAutoApprovalsReviewer: () => false, composerPermissionModeFromValues: () => 'legacy',
+    loadModels: () => new Promise(resolve => { releaseModels = resolve; }), selectComposerModel: value => selected.push(value),
+    normalizeComposerServiceTier: value => value, reconcileComposerFastSupport() {}, updateSafetyHint() {},
+  });
+  vm.runInContext(between('async function applyNativeConversationMetadata(', '\nasync function rollbackConversation('), context);
+  const applying = context.applyNativeConversationMetadata({ modelProvider: 'openai', model: 'old-model' }, { threadId: 'thread' });
+  await new Promise(resolve => setImmediate(resolve));
+  overrides.set('thread', { threadId: 'thread', writeId: 1, pending: true });
+  releaseModels(true);
+  assert.equal(await applying, false);
+  assert.deepEqual(selected, []);
+});
+
+test('returning to a conversation restores its pending model fields instead of retaining the other conversation UI', async () => {
+  const selected = [];
+  const overrides = new Map([['alpha', {
+    threadId: 'alpha', provider: 'openai', model: 'alpha-new', reasoningEffort: 'high', serviceTier: 'fast',
+    permissionMode: 'auto', sandbox: 'workspace-write', approval: 'on-request', pending: true,
+  }]]);
+  const context = vm.createContext({
+    currentConversationSource: 'codex', currentConversationId: 'alpha', nativeComposerOverrideFor: id => overrides.get(id) || null,
+    currentNativeWorkspaceKind: '', forceFullAccess: false, provider: { options: [{ value: 'openai' }], value: 'other' },
+    modelOptionsProvider: 'openai', modelLoadInFlight: null, modelLoadRevision: 1, defaultComposerServiceTier: null,
+    composerServiceTier: null, composerPermissionMode: 'legacy', sandbox: { value: 'read-only' }, approval: { value: 'never' }, reasoningEffort: { value: '' },
+    selectComposerModel: value => selected.push(value), loadModels: async () => true,
+    isAutoApprovalsReviewer: () => false, composerPermissionModeFromValues: () => 'legacy',
+    normalizeComposerServiceTier: value => value, reconcileComposerFastSupport() {}, updateSafetyHint() {},
+  });
+  vm.runInContext(between('async function applyNativeConversationMetadata(', '\nasync function rollbackConversation('), context);
+  assert.equal(await context.applyNativeConversationMetadata(
+    { modelProvider: 'openai', model: 'alpha-old', reasoningEffort: 'low' },
+    { threadId: 'alpha', preserveProviderModel: true },
+  ), true);
+  assert.equal(context.provider.value, 'openai');
+  assert.deepEqual(selected, ['alpha-new']);
+  assert.equal(context.reasoningEffort.value, 'high');
+  assert.equal(context.composerPermissionMode, 'auto');
+});
+
+test('a real loadModels request invalidated by a newer model selection cannot be rejoined by the next metadata load', async () => {
+  const releases = [];
+  const applied = [];
+  const context = vm.createContext({
+    modelLoadInFlight: null, modelLoadRevision: 0, composerModelLoadPromise: Promise.resolve(true),
+    modelListCache: new Map(), modelLoadWarnings: new Map(), modelOptionsProvider: '',
+    provider: { value: 'openai' }, model: { innerHTML: '', value: '' }, statusEl: { textContent: '' },
+    requestModels: () => new Promise(resolve => { releases.push(resolve); }),
+    uniqueComposerModelItems: items => [...new Set(items)], providerModelFallbackMessage: value => value,
+    applyComposerModels: (_provider, _items, selected) => applied.push(selected), syncComposerChrome() {}, selectComposerModel: value => applied.push(value),
+  });
+  vm.runInContext(between('function loadModels(', '\nasync function changeComposerProvider('), context);
+  vm.runInContext(between('async function waitForLatestComposerModelLoad(', '\nasync function waitForLatestNativeComposerSettings('), context);
+  const loading = context.loadModels('openai', 'old-model');
+  context.modelLoadRevision += 1;
+  context.modelLoadInFlight = null;
+  context.composerModelLoadPromise = Promise.resolve(true);
+  context.model.value = 'new-model';
+  const reloading = context.loadModels('openai', 'new-model');
+  const ready = context.waitForLatestComposerModelLoad();
+  releases[0]({ models: ['old-model', 'new-model'] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(context.modelLoadInFlight, 'the stale request finally must not clear the replacement request');
+  releases[1]({ models: ['old-model', 'new-model'] });
+  assert.equal(await reloading, true);
+  assert.equal(await loading, true);
+  assert.equal(await ready, true);
+  assert.deepEqual(applied, ['new-model']);
+  assert.equal(context.model.value, 'new-model');
+});
+
+test('a failed settings write stops send before clearing the draft', async () => {
+  let fetchCalls = 0;
+  const input = { value: 'keep this draft', style: {}, focus() {} };
+  const context = vm.createContext({
+    closeComposerPopovers() {}, input, pendingAttachments: [], canResumeInterruptedNativeTask: () => false,
+    sendBtn: { disabled: false }, appQueueEditDraft: null, conversationLoadSeq: 3, currentConversationId: 'thread', currentConversationSource: 'codex',
+    waitForLatestComposerProviderChange: async () => true, waitForLatestComposerModelLoad: async () => true,
+    waitForLatestNativeComposerSettings: async () => false, nativeComposerSettingsError: { message: 'settings failed' },
+    statusEl: { textContent: '' }, fetch: async () => { fetchCalls += 1; throw new Error('must not send'); },
+  });
+  vm.runInContext(between('async function send(){', '\n</script>'), context);
+  await context.send();
+  assert.equal(fetchCalls, 0);
+  assert.equal(input.value, 'keep this draft');
+  assert.equal(context.statusEl.textContent, 'settings failed');
 });

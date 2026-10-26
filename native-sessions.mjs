@@ -768,34 +768,34 @@ export class NativeSessionStore extends EventEmitter {
     const threadId = String(entry.id || '').trim().toLowerCase();
     const persisted = entry.threadSettings || {};
     const persistedUpdatedAtMs = Number(entry.settingsUpdatedAtMs) || 0;
+    const parsedSettingsUpdatedAtMs = Number(cache.metadata?.settingsUpdatedAtMs) || 0;
+    const persistedIsCurrent = parsedSettingsUpdatedAtMs <= 0
+      || persistedUpdatedAtMs >= parsedSettingsUpdatedAtMs;
     let overlay = this.threadSettingsOverrides.get(threadId) || null;
 
-    if (overlay) {
-      const overlayUpdatedAtMs = Number(overlay.updatedAtMs) || 0;
-      const persistedMatchesOverlay = threadSettingsMatch(persisted, overlay);
-      // Only drop the overlay when SQLite has actually caught up to the same settings.
-      // Thread row updated_at advances during normal turn activity and must not erase a
-      // newer in-memory model/provider switch that app-server has not persisted yet.
-      if (persistedMatchesOverlay) {
+    if (overlay && persistedIsCurrent) {
+      const remaining = remainingThreadSettingsOverride(overlay, persisted, {
+        acceptDifferentValues: false,
+      });
+      // SQLite updated_at also advances during ordinary turn activity, so only
+      // matching values prove that an override field has actually persisted.
+      if (!remaining) {
         this.threadSettingsOverrides.delete(threadId);
         overlay = null;
-      } else if (persistedUpdatedAtMs > overlayUpdatedAtMs && Object.keys(persisted).length) {
-        // A truly newer persisted settings snapshot can replace the overlay.
-        const persistedFields = ['modelProvider', 'model', 'reasoningEffort', 'serviceTier']
-          .filter((key) => Object.hasOwn(persisted, key));
-        const overlayFields = ['modelProvider', 'model', 'reasoningEffort', 'serviceTier']
-          .filter((key) => Object.hasOwn(overlay, key));
-        const comparable = persistedFields.filter((key) => overlayFields.includes(key));
-        if (comparable.length && comparable.every((key) => persisted[key] === overlay[key])) {
-          this.threadSettingsOverrides.delete(threadId);
-          overlay = null;
-        }
+      } else if (remaining !== overlay) {
+        this.threadSettingsOverrides.set(threadId, remaining);
+        overlay = remaining;
       }
     }
 
-    const settings = overlay || persisted;
+    const persistedBase = persistedIsCurrent ? persisted : {};
+    const settings = overlay ? { ...persistedBase, ...overlay } : persistedBase;
     if (!Object.keys(settings).length) return false;
-    const updatedAtMs = overlay ? Number(overlay.updatedAtMs) || 0 : persistedUpdatedAtMs;
+    const updatedAtMs = Math.max(
+      parsedSettingsUpdatedAtMs,
+      overlay ? Number(overlay.updatedAtMs) || 0 : 0,
+      persistedIsCurrent ? persistedUpdatedAtMs : 0,
+    );
     const merged = mergeThreadSettingsMetadata(cache.metadata, settings, updatedAtMs);
     if (merged.changed) cache.metadata = merged.metadata;
     return merged.changed;
@@ -1946,10 +1946,25 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
       );
       const next = merged.metadata;
       let changed = merged.changed;
-      // Explicit app-server settings events supersede any temporary composer overlay.
+      // A replayed rollout may contain settings older than a just-saved composer
+      // override. Only explicitly newer event fields may retire it; matching
+      // persistence is confirmed separately by the current SQLite snapshot.
+      // This keeps full-history/LRU rebuilds from snapping the selected model
+      // back while still allowing a later Desktop change.
       if (store?.threadSettingsOverrides instanceof Map) {
         const threadId = String(cache.id || '').trim().toLowerCase();
-        if (threadId) store.threadSettingsOverrides.delete(threadId);
+        const overlay = threadId ? store.threadSettingsOverrides.get(threadId) : null;
+        if (overlay) {
+          const eventIsNewer = Number.isFinite(appliedAtMs)
+            && appliedAtMs > (Number(overlay.updatedAtMs) || 0);
+          if (eventIsNewer) {
+            const remaining = remainingThreadSettingsOverride(overlay, normalized, {
+              acceptDifferentValues: true,
+            });
+            if (!remaining) store.threadSettingsOverrides.delete(threadId);
+            else if (remaining !== overlay) store.threadSettingsOverrides.set(threadId, remaining);
+          }
+        }
       }
       if (Object.hasOwn(settings, 'approval_policy')) {
         const approvalPolicy = String(settings.approval_policy || '').trim();
@@ -3550,12 +3565,19 @@ function mergeThreadSettingsMetadata(metadata, settings, updatedAtMs = 0) {
   return { metadata: next, changed };
 }
 
-function threadSettingsMatch(persisted, overlay) {
-  const fields = ['modelProvider', 'model', 'reasoningEffort', 'serviceTier']
-    .filter((key) => Object.hasOwn(overlay || {}, key));
-  return fields.length > 0 && fields.every((key) => (
-    Object.hasOwn(persisted || {}, key) && persisted[key] === overlay[key]
-  ));
+function remainingThreadSettingsOverride(overlay, authoritative, {
+  acceptDifferentValues = false,
+} = {}) {
+  const fields = ['modelProvider', 'model', 'reasoningEffort', 'serviceTier'];
+  let remaining = overlay;
+  for (const key of fields) {
+    if (!Object.hasOwn(overlay || {}, key) || !Object.hasOwn(authoritative || {}, key)) continue;
+    if (!acceptDifferentValues && authoritative[key] !== overlay[key]) continue;
+    if (remaining === overlay) remaining = { ...overlay };
+    delete remaining[key];
+  }
+  if (remaining === overlay) return overlay;
+  return fields.some((key) => Object.hasOwn(remaining, key)) ? remaining : null;
 }
 
 const THREAD_GOAL_STATUSES = new Set([

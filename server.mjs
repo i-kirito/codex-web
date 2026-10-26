@@ -12655,7 +12655,10 @@ let composerAtLoadPromise = null;
 let composerAtLoadedAt = 0;
 let composerAtSyncRevision = 0;
 let nativeComposerOverride = null;
+let nativeComposerOverrides = new Map();
+let nativeComposerSettingsRevisions = new Map();
 let nativeComposerSettingsQueue = Promise.resolve();
+let nativeComposerSettingsWrites = new Map();
 let nativeComposerSettingsWriteId = 0;
 let nativeComposerSettingsError = null;
 let modelLoadRevision = 0;
@@ -17886,6 +17889,9 @@ function enhanceComposer(){
       reconcileComposerFastSupport();
       return;
     }
+    modelLoadRevision+=1;
+    modelLoadInFlight=null;
+    composerModelLoadPromise=Promise.resolve(true);
     reconcileComposerFastSupport();
     void syncNativeComposerSettings({model:model.value});
     syncComposerChrome();
@@ -21174,6 +21180,9 @@ model?.addEventListener('focus',()=>{composerModelValueBeforeChange=model.value}
 model?.addEventListener('change',()=>{
   if(!composerModelSwitchConfirm(composerModelValueBeforeChange,model.value))return;
   composerModelValueBeforeChange=model.value;
+  modelLoadRevision+=1;
+  modelLoadInFlight=null;
+  composerModelLoadPromise=Promise.resolve(true);
   void syncNativeComposerSettings({model:model.value});
   syncComposerChrome();
 });
@@ -21473,7 +21482,8 @@ async function changeComposerProvider(nextProvider){
   const loaded=await loadModels(requestedProvider);
   const contextMatches=currentConversationSource===source&&currentConversationId===threadId;
   if(!loaded||!contextMatches){
-    if(contextMatches&&String(provider.value||'')===requestedProvider&&nativeComposerOverride?.threadId===threadId&&nativeComposerOverride?.provider===requestedProvider){clearNativeComposerOverride();void syncCurrentNativeConversation()}
+    const override=nativeComposerOverrideFor(threadId);
+    if(contextMatches&&String(provider.value||'')===requestedProvider&&override?.provider===requestedProvider){clearNativeComposerOverride(threadId);void syncCurrentNativeConversation()}
     return false;
   }
   if(source!=='codex'||!threadId){syncComposerChrome();return true}
@@ -24027,19 +24037,53 @@ function resetNewTaskComposerCwd(){
   cwd.value='';
   currentNativeWorkspaceKind='';
 }
-function clearNativeComposerOverride(){nativeComposerOverride=null}
+function nativeComposerOverrideFor(threadId){return nativeComposerOverrides.get(String(threadId||''))||null}
+function activateNativeComposerOverride(threadId){nativeComposerOverride=nativeComposerOverrideFor(threadId)}
+function nativeComposerSettingsRevision(threadId){return Number(nativeComposerSettingsRevisions.get(String(threadId||'')))||0}
+function bumpNativeComposerSettingsRevision(threadId){const id=String(threadId||'');const revision=nativeComposerSettingsRevision(id)+1;if(id)nativeComposerSettingsRevisions.set(id,revision);return revision}
+function nativeComposerSnapshotIsStale(threadId,requestRevision){return Number(requestRevision)!==nativeComposerSettingsRevision(threadId)}
+function clearNativeComposerOverride(threadId=nativeComposerOverride?.threadId||currentConversationId){
+  const id=String(threadId||'');
+  if(id)nativeComposerOverrides.delete(id);
+  if(!nativeComposerOverride||nativeComposerOverride.threadId===id)nativeComposerOverride=null;
+}
 function resetComposerProviderChange(){composerProviderChangePromise=Promise.resolve(true)}
 async function waitForLatestComposerProviderChange(){let pending;let ready;do{pending=composerProviderChangePromise;ready=await pending.catch(()=>false)}while(pending!==composerProviderChangePromise);return ready}
 async function waitForLatestComposerModelLoad(){let pending;let ready;do{pending=composerModelLoadPromise;ready=await pending.catch(()=>false)}while(pending!==composerModelLoadPromise);return ready}
+async function waitForLatestNativeComposerSettings(threadId){
+  const id=String(threadId||'');
+  let pending;let ready=true;
+  do{pending=nativeComposerSettingsWrites.get(id);if(!pending)return ready;ready=await pending.catch(()=>false)}while(pending!==nativeComposerSettingsWrites.get(id));
+  return ready;
+}
 function rememberNativeComposerOverride({pending=false,writeId=0}={}){
   if(currentConversationSource!=='codex'||!currentConversationId)return;
-  nativeComposerOverride={threadId:currentConversationId,provider:String(provider.value||''),model:String(model.value||''),reasoningEffort:String(reasoningEffort.value||''),serviceTier:normalizeComposerServiceTier(composerServiceTier),permissionMode:composerPermissionMode,sandbox:String(sandbox.value||''),approval:String(approval.value||''),pending:Boolean(pending),writeId:Number(writeId)||0};
+  const previous=nativeComposerOverrideFor(currentConversationId);
+  const startsWrite=Boolean(pending);
+  nativeComposerOverride={threadId:currentConversationId,provider:String(provider.value||''),model:String(model.value||''),reasoningEffort:String(reasoningEffort.value||''),serviceTier:normalizeComposerServiceTier(composerServiceTier),permissionMode:composerPermissionMode,sandbox:String(sandbox.value||''),approval:String(approval.value||''),pending:startsWrite||Boolean(previous?.pending),confirmed:startsWrite?false:Boolean(previous?.confirmed),expected:startsWrite?null:previous?.expected||null,writeId:Number(writeId)||Number(previous?.writeId)||0};
+  nativeComposerOverrides.set(currentConversationId,nativeComposerOverride);
+  if(startsWrite)bumpNativeComposerSettingsRevision(currentConversationId);
 }
 function setNativeComposerOverride(threadId,selectedProvider,selectedModel,selectedReasoningEffort,selectedPermissionMode=composerPermissionMode,selectedSandbox=sandbox.value,selectedApproval=approval.value,selectedServiceTier=composerServiceTier,{pending=false,writeId=0}={}){
   if(!threadId)return;
-  nativeComposerOverride={threadId,provider:String(selectedProvider||''),model:String(selectedModel||''),reasoningEffort:String(selectedReasoningEffort||''),serviceTier:normalizeComposerServiceTier(selectedServiceTier),permissionMode:String(selectedPermissionMode||'legacy'),sandbox:String(selectedSandbox||''),approval:String(selectedApproval||''),pending:Boolean(pending),writeId:Number(writeId)||0};
+  nativeComposerOverride={threadId,provider:String(selectedProvider||''),model:String(selectedModel||''),reasoningEffort:String(selectedReasoningEffort||''),serviceTier:normalizeComposerServiceTier(selectedServiceTier),permissionMode:String(selectedPermissionMode||'legacy'),sandbox:String(selectedSandbox||''),approval:String(selectedApproval||''),pending:Boolean(pending),confirmed:false,expected:null,writeId:Number(writeId)||0};
+  nativeComposerOverrides.set(threadId,nativeComposerOverride);
+  if(pending)bumpNativeComposerSettingsRevision(threadId);
 }
-function nativeComposerOverrideApplies(threadId){return Boolean(nativeComposerOverride?.pending&&nativeComposerOverride.threadId&&nativeComposerOverride.threadId===threadId)}
+function nativeComposerMetadataAcknowledges(override,metadata={}){
+  if(!override?.confirmed||!override.expected)return false;
+  const expected=override.expected;
+  if(Object.hasOwn(expected,'provider')&&String(metadata.modelProvider||'')!==String(expected.provider||''))return false;
+  if(Object.hasOwn(expected,'model')&&String(metadata.model||'')!==String(expected.model||''))return false;
+  if(Object.hasOwn(expected,'reasoningEffort')&&String(metadata.reasoningEffort||'')!==String(expected.reasoningEffort||''))return false;
+  return true;
+}
+function nativeComposerOverrideApplies(threadId,metadata=null){
+  const override=nativeComposerOverrideFor(threadId);
+  if(!override?.pending)return false;
+  if(metadata&&nativeComposerMetadataAcknowledges(override,metadata)){clearNativeComposerOverride(threadId);return false}
+  return true;
+}
 function syncNativeComposerSettings(changes={}){
   if(currentConversationSource!=='codex'||!currentConversationId)return Promise.resolve(false);
   const threadId=currentConversationId;
@@ -24058,22 +24102,28 @@ function syncNativeComposerSettings(changes={}){
       const res=await fetch('/api/native-sessions/'+encodeURIComponent(threadId),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
       const data=await res.json().catch(()=>({}));
       if(!res.ok)throw new Error(data.error||res.statusText||'设置同步失败');
-      if(currentConversationSource==='codex'&&currentConversationId===threadId&&nativeComposerOverride?.writeId===writeId){
+      bumpNativeComposerSettingsRevision(threadId);
+      const override=nativeComposerOverrideFor(threadId);
+      if(override?.writeId===writeId){
+        override.confirmed=true;
+        override.expected={...payload,...(Object.hasOwn(data,'provider')?{provider:data.provider}:{}),...(Object.hasOwn(data,'model')?{model:data.model}:{}),...(Object.hasOwn(data,'reasoningEffort')?{reasoningEffort:data.reasoningEffort}: {})};
+      }
+      if(currentConversationSource==='codex'&&currentConversationId===threadId&&override?.writeId===writeId){
         if(Object.hasOwn(data,'provider')&&data.provider&&[...provider.options].some((option)=>option.value===data.provider))provider.value=data.provider;
         if(Object.hasOwn(data,'model')&&data.model){
           if(![...model.options].some((option)=>option.value===data.model)){const option=document.createElement('option');option.value=data.model;option.textContent=data.model;model.appendChild(option)}
           model.value=data.model;
         }
         if(Object.hasOwn(data,'reasoningEffort'))reasoningEffort.value=data.reasoningEffort||'';
-        clearNativeComposerOverride();
         syncComposerChrome();
         void syncCurrentNativeConversation();
       }
       return true;
     }catch(error){
-      if(currentConversationSource==='codex'&&currentConversationId===threadId&&nativeComposerOverride?.writeId===writeId){
+      const override=nativeComposerOverrideFor(threadId);
+      if(override?.writeId===writeId)clearNativeComposerOverride(threadId);
+      if(currentConversationSource==='codex'&&currentConversationId===threadId&&override?.writeId===writeId){
         nativeComposerSettingsError={threadId,message:error?.message||'设置同步到 Codex App 失败'};
-        clearNativeComposerOverride();
         syncComposerChrome();
         void syncCurrentNativeConversation();
         statusEl.textContent=nativeComposerSettingsError.message;
@@ -24083,9 +24133,10 @@ function syncNativeComposerSettings(changes={}){
   };
   const queued=nativeComposerSettingsQueue.catch(()=>false).then(write);
   nativeComposerSettingsQueue=queued.catch(()=>false);
+  nativeComposerSettingsWrites.set(threadId,queued);
   return queued;
 }
-function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();clearNativeHistoryDeferredSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryNextPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryHasEarlierMessages=false;nativeHistoryPageLoading=false;nativeHistoryLoadReady=false;nativeHistorySyncDeferred=false;activeNativeTurnId='';currentNativeRunStatus='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();responseAnnotationsByTurn=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();resetNativeAssistantIndex();resumeNativeLiveFollowBottom();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';setNativeNoticeText('Codex App 会话 · 双向同步',{visible:true});setTopStatusText('Ready',{running:false});input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();renderFailedNativeSendDrafts()}
+function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();nativeComposerOverride=null;resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();clearNativeHistoryDeferredSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryNextPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryHasEarlierMessages=false;nativeHistoryPageLoading=false;nativeHistoryLoadReady=false;nativeHistorySyncDeferred=false;activeNativeTurnId='';currentNativeRunStatus='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();responseAnnotationsByTurn=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();resetNativeAssistantIndex();resumeNativeLiveFollowBottom();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';setNativeNoticeText('Codex App 会话 · 双向同步',{visible:true});setTopStatusText('Ready',{running:false});input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();renderFailedNativeSendDrafts()}
 function startNewChatMode(mode='work',selectedModel=''){
   if(mode!=='chat'){newChat();return}
   const chatModel=String(selectedModel||'').trim();
@@ -24377,7 +24428,7 @@ async function loadChatGPTConversation(id, options = {}) {
   const restoreRevision = ++conversationRestoreRevision;
   clearNativeCompletionSync();
   clearNativeCancelPending();
-  clearNativeComposerOverride();
+  nativeComposerOverride=null;
   clearNativeLiveItems();
   clearNativeHistoryDeferredSync();
   clearSubagentTraceStates();
@@ -24639,6 +24690,7 @@ async function loadConversation(id,source='web',options={}){
   if (source === 'chatgpt') return loadChatGPTConversation(id, options);
   if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return false}
   const nextConversationSource=source==='codex'?'codex':'web';
+  const nativeSettingsRevisionAtRequest=nextConversationSource==='codex'?nativeComposerSettingsRevision(id):0;
   const conversationChanged=id!==currentConversationId||nextConversationSource!==currentConversationSource;
   const requestedHistoryLimit=Number(options.historyPageLimit);
   const hasRequestedHistoryLimit=Number.isInteger(requestedHistoryLimit)&&requestedHistoryLimit>0;
@@ -24665,7 +24717,6 @@ async function loadConversation(id,source='web',options={}){
   if(conversationChanged){clearNativeCancelPending();resetComposerProviderChange()}
   if(conversationChanged&&appQueueEditSaving){statusEl.textContent='正在保存队列修改，请稍后切换会话';return false}
   if(conversationChanged&&appQueueEditDraft){appQueueEditDraft=null;input.value='';input.style.height='auto';clearPendingAttachments()}
-  if(source!=='codex'||currentConversationSource!=='codex'||currentConversationId!==id)clearNativeComposerOverride();
   showChatView();
   const inheritedRestoreRevision=Number(options.restoreRevision);
   const restoreRevision=Number.isInteger(inheritedRestoreRevision)&&inheritedRestoreRevision>0
@@ -24688,6 +24739,7 @@ async function loadConversation(id,source='web',options={}){
   resetTurnProcessCollection();
   currentConversationId=id;
   currentConversationSource=source==='codex'?'codex':'web';
+  activateNativeComposerOverride(currentConversationSource==='codex'?id:'');
   currentNativeRunStatus='';
   // Drop previous run chrome immediately so the header does not keep pulsing
   // the old conversation while the next one is still loading.
@@ -24756,7 +24808,8 @@ async function loadConversation(id,source='web',options={}){
   if(!webRunActive||!nativeCancelPendingMatches(currentConversationId,activeNativeTurnId))clearNativeCancelPending();
   syncComposerContextWindow(conversation.contextWindow||null);
   if(currentConversationSource==='codex'){
-    await applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(conversation.id)});
+    const staleSettingsSnapshot=nativeComposerSnapshotIsStale(conversation.id,nativeSettingsRevisionAtRequest);
+    await applyNativeConversationMetadata(conversation.metadata||{},{threadId:conversation.id,preserveProviderModel:staleSettingsSnapshot||nativeComposerOverrideApplies(conversation.id,conversation.metadata||{})});
     if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==conversation.id)return false;
   }
   applyConversationMode();
@@ -24960,9 +25013,28 @@ function updateConversationStatus(conversation){
     setNativeNoticeText(nativeNotice?.textContent||'',{visible:false});
   }
 }
-async function applyNativeConversationMetadata(metadata,{preserveProviderModel=false,preservePermissions=preserveProviderModel}={}){
+async function applyNativeConversationMetadata(metadata,{threadId=currentConversationId,preserveProviderModel=false,preservePermissions=preserveProviderModel}={}){
+  const overrideAtStart=nativeComposerOverrideFor(threadId);
   currentNativeWorkspaceKind=String(metadata.workspaceKind||currentNativeWorkspaceKind||'');
   if(metadata.cwd)cwd.value=metadata.cwd;
+  if(preserveProviderModel&&overrideAtStart){
+    const overrideProvider=String(overrideAtStart.provider||'');
+    if([...provider.options].some((option)=>option.value===overrideProvider)){
+      provider.value=overrideProvider;
+      if(modelOptionsProvider!==overrideProvider||modelLoadInFlight?.provider===overrideProvider)await loadModels(overrideProvider,overrideAtStart.model);
+    }
+    if(currentConversationSource!=='codex'||currentConversationId!==threadId)return false;
+    if(nativeComposerOverrideFor(threadId)!==overrideAtStart)return false;
+    selectComposerModel(overrideAtStart.model);
+    if(['','low','medium','high','xhigh','max','ultra'].includes(overrideAtStart.reasoningEffort))reasoningEffort.value=overrideAtStart.reasoningEffort;
+    composerServiceTier=normalizeComposerServiceTier(overrideAtStart.serviceTier);
+    if(!forceFullAccess){
+      composerPermissionMode=overrideAtStart.permissionMode||composerPermissionMode;
+      if(overrideAtStart.sandbox)sandbox.value=overrideAtStart.sandbox;
+      if(overrideAtStart.approval)approval.value=overrideAtStart.approval;
+    }
+    reconcileComposerFastSupport();
+  }
   if(!forceFullAccess&&!preservePermissions){
     if(['read-only','workspace-write','danger-full-access'].includes(metadata.sandboxPolicy))sandbox.value=metadata.sandboxPolicy;
     if(['never','on-request','untrusted'].includes(metadata.approvalPolicy))approval.value=metadata.approvalPolicy;
@@ -24988,6 +25060,8 @@ async function applyNativeConversationMetadata(metadata,{preserveProviderModel=f
         modelLoadRevisionAtApply=modelLoadRevision;
         await modelLoad;
       }
+      if(currentConversationSource!=='codex'||currentConversationId!==threadId)return false;
+      if(nativeComposerOverrideFor(threadId)!==overrideAtStart)return false;
       if(String(provider.value||'')!==modelProvider)return false;
       if(modelLoadRevision===modelLoadRevisionAtApply&&Object.hasOwn(metadata,'model'))selectComposerModel(selectedModel);
     }
@@ -25322,6 +25396,7 @@ async function syncCurrentNativeConversationOnce(){
   if(deferNativeSyncForHistoryPage())return;
   const renderSnapshotImmediately=nativeLiveDocumentHidden()||nativeSnapshotResumeCatchup;
   const id=currentConversationId;
+  const nativeSettingsRevisionAtRequest=nativeComposerSettingsRevision(id);
   const seq=conversationLoadSeq;
   const url='/api/native-sessions/'+encodeURIComponent(id)+'?images=external&history=page&latest=complete&limit='+nativeHistoryPageLimit+'&after='+nativeCursor+'&generation='+nativeGeneration;
   const res=await fetch(url);
@@ -25342,7 +25417,8 @@ async function syncCurrentNativeConversationOnce(){
       rememberLimitPauseFromText(id,latestProcess.content);
     }
   }
-  await applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(id)});
+  const staleSettingsSnapshot=nativeComposerSnapshotIsStale(id,nativeSettingsRevisionAtRequest);
+  await applyNativeConversationMetadata(conversation.metadata||{},{threadId:id,preserveProviderModel:staleSettingsSnapshot||nativeComposerOverrideApplies(id,conversation.metadata||{})});
   if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
   if(deferNativeSyncForHistoryPage())return;
   syncComposerContextWindow(conversation.contextWindow||null);
@@ -30634,9 +30710,10 @@ async function send(){
   }
   const providerReady=await waitForLatestComposerProviderChange();
   const modelReady=await waitForLatestComposerModelLoad();
-  await nativeComposerSettingsQueue.catch(()=>false);
+  const settingsReady=await waitForLatestNativeComposerSettings(sendConversationId);
   if(!sendContextMatches())return;
   if(providerReady===false||modelReady===false){statusEl.textContent='服务商模型尚未准备好，请重新选择后再发送';return}
+  if(settingsReady===false){statusEl.textContent=nativeComposerSettingsError?.message||'模型设置保存失败，请重试后再发送';return}
   const existingId=currentConversationSource==='codex'?currentConversationId:'';
   if(existingId&&webRunActive){
     enqueuePrompt(text,attachments);
@@ -30667,6 +30744,7 @@ async function send(){
     const requestedSandbox=sandbox.value;
     const requestedApproval=approval.value;
     setNativeComposerOverride(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,{pending:true});
+    const submittedComposerOverride=nativeComposerOverrideFor(existingId);
     const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,attachments,provider:requestedProvider,model:requestedModel,reasoningEffort:reasoningEffort.value,serviceTier:requestedServiceTier,cwd:cwd.value,...composerPermissionPayload()})});
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||res.statusText);
@@ -30674,7 +30752,11 @@ async function send(){
     if(!sendContextMatches()){refreshHistory();return}
     currentConversationSource='codex';
     currentConversationId=data.threadId;
-    setNativeComposerOverride(data.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,{pending:true});
+    let sentComposerOverride=null;
+    if(!existingId||nativeComposerOverrideFor(existingId)===submittedComposerOverride){
+      setNativeComposerOverride(data.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,{pending:true});
+      sentComposerOverride=nativeComposerOverrideFor(data.threadId);
+    }
     activeNativeTurnId=data.turnId||'';
     if(!existingId){nativeCursor=0;nativeGeneration=0}
     updateActiveHistory();
@@ -30684,7 +30766,8 @@ async function send(){
     setTimeout(async()=>{
       if(sendLoadSeq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==data.threadId)return;
       try{await syncCurrentNativeConversation()}catch{}
-      if(sendLoadSeq===conversationLoadSeq&&currentConversationId===data.threadId&&nativeComposerOverride?.threadId===data.threadId&&nativeComposerOverride?.pending)clearNativeComposerOverride();
+      const override=nativeComposerOverrideFor(data.threadId);
+      if(sendLoadSeq===conversationLoadSeq&&currentConversationId===data.threadId&&override===sentComposerOverride&&override?.pending)clearNativeComposerOverride(data.threadId);
     },240);
     refreshHistory();
   }catch(e){
